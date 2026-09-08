@@ -1,0 +1,5 @@
+# nemo-toolkit==2.1.0
+# torch==2.7.0
+# torchaudio==2.7.0
+nemo_toolkit[asr]
+cuda-python==12.9.7

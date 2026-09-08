@@ -1,0 +1,11 @@
+Cython
+
+packaging
+
+nemo_toolkit[asr]>=2.6.0
+
+torch>=2.6, <3
+
+soundfile
+
+cuda-python==12.9.7
