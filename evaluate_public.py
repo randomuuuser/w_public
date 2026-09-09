@@ -32,6 +32,7 @@ Spearman). Two additions:
 """
 
 import numpy as np
+from sklearn.dummy import DummyRegressor
 from sklearn.linear_model import Lasso, Ridge
 from sklearn.model_selection import GridSearchCV, GroupKFold, KFold
 from sklearn.pipeline import make_pipeline
@@ -40,27 +41,9 @@ from sklearn.preprocessing import StandardScaler
 from evaluate import make_model, regression_metrics
 from features import PROXY_ROLES, build_features
 
-
-WER_CLIP = (0.0, 2.0)
-
 RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)
 LASSO_ALPHAS = (0.0001, 0.001, 0.01, 0.1)
-
-# Kept small on purpose: the grid is searched inside every outer fold, so its
-# size multiplies the runtime of every protocol.
-HGB_GRID = {
-    "max_depth": [3, 5, None],
-    "learning_rate": [0.03, 0.05, 0.1],
-    "max_iter": [200, 400],
-    "min_samples_leaf": [10, 20],
-}
-
-XGB_GRID = {
-    "max_depth": [3, 5, 7],
-    "learning_rate": [0.03, 0.05, 0.1],
-    "n_estimators": [200, 400],
-    "min_child_weight": [5, 20],
-}
+WER_CLIP = (0.0, 2.0)
 
 # Feature used by the "pwer" baseline. pwer_mean averages the disagreement with
 # both proxies; Waheed et al. use a single proxy, the best-ranked model other
@@ -182,7 +165,28 @@ def splits(protocol, meta, n_splits=5):
     return folds
 
 
-def build_estimator(model, seed=0):
+class ProxyBaseline:
+    """
+    Estimator returning one feature column unchanged as its prediction.
+
+    The pwer baseline needs no fitting, but deploy.predict calls .predict on
+    whatever sits in the bundle, so it has to be wrapped in an estimator to be
+    packaged and ranked like any other model.
+    """
+
+    def __init__(self, index=0):
+        self.index = index
+
+    def fit(self, X, y=None):
+        """Nothing to learn; kept for the scikit-learn interface."""
+        return self
+
+    def predict(self, X):
+        """Return the proxy column of the feature matrix."""
+        return np.asarray(X, dtype=float)[:, self.index]
+
+
+def build_estimator(model, seed=0, proxy_index=0):
     """
     Create an estimator and its hyperparameter grid.
 
@@ -193,24 +197,27 @@ def build_estimator(model, seed=0):
     Args:
         model: Model name from MODELS.
         seed: Random seed.
+        proxy_index: Column of the proxy feature, used by the pwer baseline.
 
     Returns:
         Estimator and grid, the grid being None when there is nothing to tune.
     """
+    if model == "mean":
+        return DummyRegressor(strategy="mean"), None
+    if model == "pwer":
+        return ProxyBaseline(proxy_index), None
     if model == "ridge":
         return (make_pipeline(StandardScaler(), Ridge()),
                 {"ridge__alpha": list(RIDGE_ALPHAS)})
     if model == "lasso":
         return (make_pipeline(StandardScaler(), Lasso(max_iter=20000)),
                 {"lasso__alpha": list(LASSO_ALPHAS)})
-    if model == "hgb":
-        return make_model("hgb", seed), dict(HGB_GRID)
-    if model == "xgb":
-        return make_model("xgb", seed), dict(XGB_GRID)
+    if model in ("hgb", "xgb"):
+        return make_model(model, seed), None
     raise ValueError(f"unknown model {model}")
 
 
-def _tuned_fit(model, X, y, train, groups, seed):
+def _tuned_fit(model, X, y, train, groups, seed, proxy_index=0):
     """
     Fit an estimator, tuning it with grouped inner folds when it has a grid.
 
@@ -225,7 +232,7 @@ def _tuned_fit(model, X, y, train, groups, seed):
     Returns:
         Fitted estimator.
     """
-    estimator, grid = build_estimator(model, seed)
+    estimator, grid = build_estimator(model, seed, proxy_index)
     if grid is None:
         return estimator.fit(X[train], y[train])
 
@@ -268,6 +275,88 @@ def fit_predict(model, X, y, train, test, groups=None, seed=0):
 
 
 fit_predict.proxy_index = 0  # set by run_protocol before use
+
+
+def concordance_index(y_true, y_pred, max_pairs=2000000, seed=0):
+    """
+    Share of comparable pairs ranked in the right order (Harrell's C).
+
+    Over continuous outcomes it is a rescaling of Kendall's tau rather than an
+    independent signal, so read the two together rather than as two results.
+    Pairs are sampled when the exhaustive count would be too large.
+
+    Args:
+        y_true: True values.
+        y_pred: Predicted values.
+        max_pairs: Cap above which pairs are sampled instead of enumerated.
+        seed: Random seed for the sampling.
+
+    Returns:
+        Concordance index, or None when no pair is comparable.
+    """
+    n = len(y_true)
+    if n < 2:
+        return None
+
+    if n * (n - 1) // 2 <= max_pairs:
+        i, j = np.triu_indices(n, k=1)
+    else:
+        rng = np.random.default_rng(seed)
+        i = rng.integers(0, n, size=max_pairs)
+        j = rng.integers(0, n, size=max_pairs)
+        keep = i != j
+        i, j = i[keep], j[keep]
+
+    true_difference = y_true[i] - y_true[j]
+    comparable = true_difference != 0
+    if not comparable.any():
+        return None
+
+    predicted_difference = y_pred[i] - y_pred[j]
+    concordant = (np.sign(true_difference) == np.sign(predicted_difference)) \
+        & comparable
+    tied = (predicted_difference == 0) & comparable
+    return float((concordant.sum() + 0.5 * tied.sum()) / comparable.sum())
+
+
+def extended_metrics(y_true, y_pred, floor=1e-9):
+    """
+    Regression metrics, plus the rank and relative-error ones.
+
+    MAPE is undefined wherever the true WER is zero, which is a large share of
+    clean public segments, so it is computed on the non-zero subset only and
+    reported with the count it was computed on. Read it as a partial metric.
+
+    Args:
+        y_true: True values.
+        y_pred: Predicted values.
+        floor: Threshold below which a true value counts as zero.
+
+    Returns:
+        Metric dictionary.
+    """
+    from scipy.stats import kendalltau
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    metrics = regression_metrics(y_true, y_pred)
+    out = {k: round(float(metrics[k]), 4) for k in
+           ("MAE", "RMSE", "R2", "bias", "pearson", "spearman")}
+
+    nonzero = np.abs(y_true) > floor
+    out["MAPE"] = round(float(np.mean(
+        np.abs((y_pred[nonzero] - y_true[nonzero]) / y_true[nonzero]))), 4) \
+        if nonzero.any() else None
+    out["MAPE_n"] = int(nonzero.sum())
+
+    tau = kendalltau(y_true, y_pred)
+    out["kendall"] = round(float(tau.statistic), 4) \
+        if np.isfinite(tau.statistic) else None
+
+    c_index = concordance_index(y_true, y_pred)
+    out["c_index"] = round(c_index, 4) if c_index is not None else None
+    return out
 
 
 def corpus_wer_gap(y_pred, meta, index=None):
@@ -461,15 +550,7 @@ def summarize(result, n_boot=500):
     table = {}
 
     for model, prediction in result["predictions"].items():
-        metrics = regression_metrics(y, prediction)
-        row = {
-            "MAE": round(metrics["MAE"], 4),
-            "RMSE": round(metrics["RMSE"], 4),
-            "R2": round(metrics["R2"], 4),
-            "bias": round(metrics["bias"], 4),
-            "pearson": round(metrics["pearson"], 4),
-            "spearman": round(metrics["spearman"], 4),
-        }
+        row = extended_metrics(y, prediction)
         row.update(corpus_wer_gap(prediction, meta))
         if n_boot:
             interval = cluster_bootstrap(y, prediction, meta["cv_group"],
@@ -740,7 +821,7 @@ def fit_bundle(rows, model="ridge", blocks=("proxy", "text"), roles=PROXY_ROLES,
 
     Args:
         rows: Labelled records.
-        model: Model name from MODELS, excluding the mean and pwer baselines.
+        model: Model name from MODELS, baselines included.
         blocks: Feature blocks to include.
         roles: Proxy ASR systems.
         feature_set: "transferable" or "full".
@@ -753,7 +834,8 @@ def fit_bundle(rows, model="ridge", blocks=("proxy", "text"), roles=PROXY_ROLES,
     """
     X, names, meta = design(rows, blocks, roles, feature_set)
     y, groups = meta["y"], meta["cv_group"]
-    estimator = _tuned_fit(model, X, y, np.arange(len(y)), groups, seed)
+    estimator = _tuned_fit(model, X, y, np.arange(len(y)), groups, seed,
+                           proxy_index=proxy_column(names))
 
     return {
         "bundle_version": 1,
@@ -773,3 +855,74 @@ def fit_bundle(rows, model="ridge", blocks=("proxy", "text"), roles=PROXY_ROLES,
         "train_conditions": sorted(set(meta["condition"].tolist())),
         "notes": notes,
     }
+
+
+def evaluate_bundle(bundle, rows, levels=("segment", "call"), n_boot=500):
+    """
+    Score a trained bundle on labelled records, at segment level, call level, or both.
+
+    The two levels answer different questions and can disagree. The segment
+    level says how accurate a single estimate is; the call level says whether
+    the duration-weighted aggregation lands on the right value and ranks calls
+    correctly, which is the operational use.
+
+    Only the bundle is scored. To compare against a baseline, build it with
+    fit_bundle(rows, model="pwer") or model="mean" and score it the same way.
+
+    Args:
+        bundle: Bundle from fit_bundle or deploy.fit_final.
+        rows: Labelled records.
+        levels: Any of "segment" and "call".
+        n_boot: Bootstrap replicates for the segment level, 0 to skip.
+
+    Returns:
+        Metrics per requested level.
+    """
+    from deploy import predict as deploy_predict
+
+    y = np.array([r["label_wer"] for r in rows], dtype=float)
+    prediction = np.clip(deploy_predict(bundle, rows), *WER_CLIP)
+    groups = np.array([r["sample_id"] for r in rows])
+
+    report = {
+        "model": bundle.get("model"),
+        "feature_set": bundle.get("feature_set"),
+        "n_segments": len(rows),
+        "n_calls": int(len(set(groups))),
+        "wer_mean": round(float(y.mean()), 4),
+        "wer_std": round(float(y.std()), 4),
+    }
+
+    if "segment" in levels:
+        meta = {
+            "n_hyp_words": np.array(
+                [max(r.get("n_hyp_words", 0), 1) for r in rows], dtype=float),
+            "n_ref_words": np.array([r["n_ref_words"] for r in rows],
+                                    dtype=float),
+            "label_errors": np.array([r["label_errors"] for r in rows],
+                                     dtype=float),
+        }
+        entry = extended_metrics(y, prediction)
+        entry.update(corpus_wer_gap(prediction, meta))
+        if n_boot:
+            interval = cluster_bootstrap(y, prediction, groups, n_boot=n_boot)
+            entry["MAE_ci"] = [interval["ci_low"], interval["ci_high"]]
+        report["segment"] = entry
+
+    if "call" in levels:
+        true_calls, predicted_calls = _aggregate_calls(y, prediction, rows)
+        if true_calls.size < 3:
+            report["call"] = {"n_calls": int(true_calls.size),
+                              "note": "too few calls to score"}
+        else:
+            entry = extended_metrics(true_calls, predicted_calls)
+            entry["wer_call_std"] = round(float(true_calls.std()), 4)
+            report["call"] = entry
+
+    return report
+
+# bundle_hgb  = ep.fit_bundle(pool_public, model="hgb")
+# bundle_pwer = ep.fit_bundle(pool_public, model="pwer")
+
+# ep.evaluate_bundle(bundle_hgb, rows_internal)                     # seul
+# ep.evaluate_bundle(bundle_pwer, rows_internal, levels=("call",))  # quand tu veux la barre
