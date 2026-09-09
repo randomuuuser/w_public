@@ -921,8 +921,96 @@ def evaluate_bundle(bundle, rows, levels=("segment", "call"), n_boot=500):
 
     return report
 
+
+def true_wer(rows, level="call"):
+    """
+    Return the reference WER in the same shape as pipeline.rank, for joining.
+
+    Keys match rank's output, with wer_true in place of wer_estimated, so the
+    two tables can be merged on call or segment_id and read side by side.
+
+    At call level two aggregations are returned. wer_true is the definition of
+    a call's WER, total errors over total reference words. wer_true_duration is
+    the duration-weighted mean of segment WER, which is how deploy.predict_calls
+    aggregates its estimates: compare against that one when judging the
+    estimator, and against wer_true when reporting the real quality of a call.
+
+    Args:
+        rows: Labelled records.
+        level: "call", "segment", or "both".
+
+    Returns:
+        Call entries, segment entries, or a dict holding both.
+    """
+    if level not in ("call", "segment", "both"):
+        raise ValueError(f"unknown level {level}, expected call, segment or both")
+
+    segments = None
+    if level in ("segment", "both"):
+        segments = [
+            {"segment_id": row["segment_id"], "call": row["sample_id"],
+             "duration_s": round(float(row["duration"]), 1),
+             "n_ref_words": int(row["n_ref_words"]),
+             "errors": int(row["label_errors"]),
+             "wer_true": round(float(row["label_wer"]), 4)}
+            for row in rows
+        ]
+        segments.sort(key=lambda item: -item["wer_true"])
+
+    if level == "segment":
+        return segments
+
+    by_call = {}
+    for row in rows:
+        entry = by_call.setdefault(row["sample_id"], {
+            "call": row["sample_id"], "n_segments": 0, "duration_s": 0.0,
+            "errors": 0, "n_ref_words": 0, "weighted_wer": 0.0})
+        entry["n_segments"] += 1
+        entry["duration_s"] += float(row["duration"])
+        entry["errors"] += int(row["label_errors"])
+        entry["n_ref_words"] += int(row["n_ref_words"])
+        entry["weighted_wer"] += float(row["label_wer"]) * float(row["duration"])
+
+    calls = []
+    for entry in by_call.values():
+        duration = entry["duration_s"]
+        calls.append({
+            "call": entry["call"],
+            "n_segments": entry["n_segments"],
+            "duration_s": round(duration, 1),
+            "n_ref_words": entry["n_ref_words"],
+            "errors": entry["errors"],
+            "wer_true": round(entry["errors"] / entry["n_ref_words"], 4)
+            if entry["n_ref_words"] else None,
+            "wer_true_duration": round(entry["weighted_wer"] / duration, 4)
+            if duration > 0 else None,
+        })
+    calls.sort(key=lambda item: -(item["wer_true"] or 0.0))
+
+    return calls if level == "call" else {"call": calls, "segment": segments}
+
+
+
 # bundle_hgb  = ep.fit_bundle(pool_public, model="hgb")
 # bundle_pwer = ep.fit_bundle(pool_public, model="pwer")
 
 # ep.evaluate_bundle(bundle_hgb, rows_internal)                     # seul
 # ep.evaluate_bundle(bundle_pwer, rows_internal, levels=("call",))  # quand tu veux la barre
+
+
+
+
+
+# import pandas as pd, evaluate_public as ep, pipeline as pl
+
+# estimated = pd.DataFrame(pl.rank(bundle, rows_internal, level="call"))
+# actual    = pd.DataFrame(ep.true_wer(rows_internal, level="call"))
+
+# table = estimated.merge(actual, on="call", suffixes=("", "_ref"))
+# table["gap"] = table["wer_estimated"] - table["wer_true"]
+# print(table.sort_values("gap", key=abs, ascending=False).to_string(index=False))
+
+# # même chose au niveau segment, la jointure se fait sur segment_id
+# segments = (pd.DataFrame(pl.rank(bundle, rows_internal, level="segment"))
+#               .merge(pd.DataFrame(ep.true_wer(rows_internal, level="segment")),
+#                      on="segment_id", suffixes=("", "_ref")))
