@@ -425,26 +425,69 @@ def fit(rows, out_dir=None, target="wer", model="hgb", blocks=("proxy", "text", 
     return bundle
 
 
-def rank(bundle, rows):
+# def rank(bundle, rows):
+#     """
+#     Rank calls by their estimated WER.
+
+#     Args:
+#         bundle: Trained model bundle.
+#         rows: Input records.
+
+#     Returns:
+#         Ranked calls.
+
+#     Note: rows only require hyp_target_norm, the proxy hypotheses, duration and
+#     sample_id.
+#     """
+#     import pandas as pd
+#     from deploy import predict_calls
+
+#     table = pd.DataFrame(predict_calls(bundle, rows))
+#     print(table.to_string(index=False))
+#     return table
+
+
+def rank(bundle, rows, level="call", norm_config=None):
     """
-    Rank calls by their estimated WER.
+    Rank transcriptions by estimated WER.
 
     Args:
-        bundle: Trained model bundle.
-        rows: Input records.
+        bundle: Trained bundle.
+        rows: Records to score.
+        level: "call", "segment", or "both".
+        norm_config: Normalization settings.
 
     Returns:
-        Ranked calls.
-
-    Note: rows only require hyp_target_norm, the proxy hypotheses, duration and
-    sample_id.
+        Call-level entries, segment-level entries, or a dict holding both.
     """
-    import pandas as pd
-    from deploy import predict_calls
+    from deploy import predict_calls, predict
+    if level not in ("call", "segment", "both"):
+        raise ValueError(f"unknown level {level}, expected call, segment or both")
 
-    table = pd.DataFrame(predict_calls(bundle, rows))
-    print(table.to_string(index=False))
-    return table
+    segments = None
+    if level in ("segment", "both"):
+        estimates = predict(bundle, rows, norm_config)
+        segments = [
+            {"segment_id": row["segment_id"], "call": row["sample_id"],
+             "duration_s": round(float(row["duration"]), 1),
+             "wer_estimated": round(float(value), 4)}
+            for row, value in zip(rows, estimates)
+        ]
+        segments.sort(key=lambda item: -item["wer_estimated"])
+
+    if level == "segment":
+        return segments
+
+    calls = predict_calls(bundle, rows, norm_config)
+    return calls if level == "call" else {"call": calls, "segment": segments}
+
+
+# import evaluate_public as ep, json
+
+# report = ep.evaluate_bundle(bundle, rows_internal)          # les deux niveaux
+# print(json.dumps(report, indent=1))
+
+# ep.evaluate_bundle(bundle, rows_internal, levels=("call",)) # un seul
 
 
 def report_metrics(rows, target="wer", model="hgb", blocks=("proxy", "text", "extra"),
