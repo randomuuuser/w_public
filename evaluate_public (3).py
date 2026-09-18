@@ -1,0 +1,1200 @@
+"""
+Evaluation protocols and baselines for the public pool.
+
+Everything here answers one question: does the estimator still work when the
+test data was not drawn from the training distribution? Four protocols, each
+one holding out a different axis:
+
+    group  in-distribution, grouped k-fold (leakage-safe within the pool)
+    lodo   leave-one-dataset-out, the protocol of Waheed et al. (ACL 2025)
+    lolo   leave-one-language-out
+    loco   leave-one-condition-out, does the model extrapolate to an unseen
+           acoustic degradation
+
+Baselines, reported next to every model so that a score can be read:
+
+    mean      predict the training mean (a positive R2 must beat this)
+    pwer      use the raw proxy disagreement as the WER estimate. This is the
+              "W PROXY" baseline of Waheed et al., table 4: their regression
+              beats it on 7 datasets out of 8
+    pwer_lin  univariate linear regression on the same quantity
+    ridge     standardized ridge, the model whose coefficients are transferred
+
+Metrics reuse evaluate.regression_metrics (MAE, RMSE, R2, bias, Pearson,
+Spearman). Two additions:
+  - corpus_wer_gap, the difference between the aggregate WER announced by the
+    estimator and the true one. Waheed et al. compare WER and aWER at dataset
+    level, eWER3 (Chowdhury and Ali, 2023) reports the same aggregate. It is a
+    bias, not a dispersion: segment errors cancel in the aggregate, so it is not
+    redundant with MAE.
+  - a cluster bootstrap over groups, giving confidence intervals that account
+    for the fact that segments within a group are not independent.
+"""
+
+import numpy as np
+from sklearn.dummy import DummyRegressor
+from sklearn.linear_model import Lasso, Ridge
+from sklearn.model_selection import GridSearchCV, GroupKFold, KFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+from evaluate import (BAD_THRESHOLD, binary_metrics, make_model,
+                      precision_at_k, regression_metrics)
+from features import PROXY_ROLES, build_features
+
+RIDGE_ALPHAS = (0.01, 0.1, 1.0, 10.0, 100.0)
+LASSO_ALPHAS = (0.0001, 0.001, 0.01, 0.1)
+WER_CLIP = (0.0, 2.0)
+
+# Feature used by the "pwer" baseline. pwer_mean averages the disagreement with
+# both proxies; Waheed et al. use a single proxy, the best-ranked model other
+# than the target, so set this to "pwer_proxy_a" for strict parity with their
+# W PROXY baseline.
+PROXY_BASELINE_FEATURE = "pwer_mean"
+
+# Features that are ratios or rates, hence comparable across corpora with
+# different segment lengths. Counts and durations are excluded from the
+# transferable set: their scale is corpus-specific, and x_is_operator is
+# constant on public data.
+SCALE_FREE_PREFIXES = ("pwer", "pcer", "psub", "pdel", "pins", "plen")
+SCALE_FREE_TEXT = ("gzip_ratio", "type_token_ratio", "repeated_word_ratio",
+                   "chars_per_word", "words_per_second")
+
+MODELS = ("mean", "pwer", "ridge", "lasso", "hgb", "xgb")
+
+
+def is_transferable(name):
+    """
+    Whether a feature keeps its meaning across corpora of different lengths.
+
+    Args:
+        name: Feature name.
+
+    Returns:
+        True when the feature is scale free.
+    """
+    return name.startswith(SCALE_FREE_PREFIXES) or name in SCALE_FREE_TEXT
+
+
+def design(rows, blocks=("proxy", "text"), roles=PROXY_ROLES,
+           feature_set="transferable"):
+    """
+    Build the design matrix and the metadata arrays used by every protocol.
+
+    Args:
+        rows: Labelled records.
+        blocks: Feature blocks to include.
+        roles: Proxy ASR systems.
+        feature_set: "transferable" or "full".
+
+    Returns:
+        Feature matrix, feature names and metadata arrays.
+    """
+    X, _, y_wer, _, names = build_features(rows, blocks=blocks, roles=roles)
+    X = np.asarray(X, dtype=float)
+
+    if feature_set == "transferable":
+        keep = [i for i, name in enumerate(names) if is_transferable(name)]
+    elif feature_set == "full":
+        keep = list(range(len(names)))
+    else:
+        raise ValueError(f"unknown feature_set {feature_set}")
+
+    meta = {
+        "y": np.asarray(y_wer, dtype=float),
+        "cv_group": np.array([r.get("group_id") or r["sample_id"] for r in rows]),
+        "corpus": np.array([r.get("corpus", "internal") for r in rows]),
+        "lang": np.array([r["lang"] for r in rows]),
+        "condition": np.array([r.get("condition", "clean") for r in rows]),
+        "n_ref_words": np.array([r["n_ref_words"] for r in rows], dtype=float),
+        "n_hyp_words": np.array([max(r.get("n_hyp_words", 0), 1) for r in rows],
+                                dtype=float),
+        "label_errors": np.array([r["label_errors"] for r in rows], dtype=float),
+    }
+    return X[:, keep], [names[i] for i in keep], meta
+
+
+def proxy_column(names):
+    """
+    Locate the column holding the raw proxy disagreement.
+
+    Args:
+        names: Feature names.
+
+    Returns:
+        Column index of pwer_mean, or of the first pwer feature available.
+    """
+    if PROXY_BASELINE_FEATURE in names:
+        return names.index(PROXY_BASELINE_FEATURE)
+    for index, name in enumerate(names):
+        if name.startswith("pwer_"):
+            return index
+    raise ValueError("no proxy feature in the design matrix")
+
+
+def splits(protocol, meta, n_splits=5):
+    """
+    Yield the train and test indices of a protocol.
+
+    Args:
+        protocol: One of "group", "lodo", "lolo", "loco".
+        meta: Metadata arrays from design().
+        n_splits: Number of folds for the "group" protocol.
+
+    Returns:
+        List of (fold name, train indices, test indices).
+    """
+    if protocol == "group":
+        groups = meta["cv_group"]
+        n_groups = len(set(groups))
+        splitter = GroupKFold(n_splits=min(n_splits, n_groups))
+        dummy = np.zeros(len(groups))
+        return [(f"fold{i}", train, test) for i, (train, test)
+                in enumerate(splitter.split(dummy, dummy, groups))]
+
+    key = {"lodo": "corpus", "lolo": "lang", "loco": "condition"}.get(protocol)
+    if key is None:
+        raise ValueError(f"unknown protocol {protocol}")
+
+    values = meta[key]
+    folds = []
+    for held in sorted(set(values)):
+        test = np.where(values == held)[0]
+        train = np.where(values != held)[0]
+        if train.size and test.size:
+            folds.append((f"{key}={held}", train, test))
+    return folds
+
+
+class ProxyBaseline:
+    """
+    Estimator returning one feature column unchanged as its prediction.
+
+    The pwer baseline needs no fitting, but deploy.predict calls .predict on
+    whatever sits in the bundle, so it has to be wrapped in an estimator to be
+    packaged and ranked like any other model.
+    """
+
+    def __init__(self, index=0):
+        self.index = index
+
+    def fit(self, X, y=None):
+        """Nothing to learn; kept for the scikit-learn interface."""
+        return self
+
+    def predict(self, X):
+        """Return the proxy column of the feature matrix."""
+        return np.asarray(X, dtype=float)[:, self.index]
+
+
+def build_estimator(model, seed=0, proxy_index=0):
+    """
+    Create an estimator and its hyperparameter grid.
+
+    Linear models are standardized because their penalty is scale sensitive;
+    tree ensembles are not, so they are used as returned by evaluate.make_model
+    and stay identical to what the internal pipeline already trains.
+
+    Args:
+        model: Model name from MODELS.
+        seed: Random seed.
+        proxy_index: Column of the proxy feature, used by the pwer baseline.
+
+    Returns:
+        Estimator and grid, the grid being None when there is nothing to tune.
+    """
+    if model == "mean":
+        return DummyRegressor(strategy="mean"), None
+    if model == "pwer":
+        return ProxyBaseline(proxy_index), None
+    if model == "ridge":
+        return (make_pipeline(StandardScaler(), Ridge()),
+                {"ridge__alpha": list(RIDGE_ALPHAS)})
+    if model == "lasso":
+        return (make_pipeline(StandardScaler(), Lasso(max_iter=20000)),
+                {"lasso__alpha": list(LASSO_ALPHAS)})
+    if model in ("hgb", "xgb"):
+        return make_model(model, seed), None
+    raise ValueError(f"unknown model {model}")
+
+
+def _tuned_fit(model, X, y, train, groups, seed, proxy_index=0):
+    """
+    Fit an estimator, tuning it with grouped inner folds when it has a grid.
+
+    Args:
+        model: Model name from MODELS.
+        X: Feature matrix.
+        y: Target vector.
+        train: Training indices.
+        groups: Cross-validation groups.
+        seed: Random seed.
+
+    Returns:
+        Fitted estimator.
+    """
+    estimator, grid = build_estimator(model, seed, proxy_index)
+    if grid is None:
+        return estimator.fit(X[train], y[train])
+
+    train_groups = groups[train] if groups is not None else None
+    if train_groups is not None and len(set(train_groups)) >= 3:
+        search = GridSearchCV(estimator, grid, cv=GroupKFold(3),
+                              scoring="neg_mean_absolute_error")
+        search.fit(X[train], y[train], groups=train_groups)
+    else:
+        search = GridSearchCV(estimator, grid,
+                              cv=KFold(3, shuffle=True, random_state=seed),
+                              scoring="neg_mean_absolute_error")
+        search.fit(X[train], y[train])
+    return search
+
+
+def fit_predict(model, X, y, train, test, groups=None, seed=0):
+    """
+    Fit one model on a training fold and predict the test fold.
+
+    Args:
+        model: Model name from MODELS.
+        X: Feature matrix.
+        y: Target vector.
+        train: Training indices.
+        test: Test indices.
+        groups: Cross-validation groups, used to tune without leakage.
+        seed: Random seed.
+
+    Returns:
+        Predictions on the test fold.
+    """
+    if model == "mean":
+        return np.full(test.size, float(y[train].mean()))
+
+    if model == "pwer":
+        return X[test, fit_predict.proxy_index]
+
+    return _tuned_fit(model, X, y, train, groups, seed).predict(X[test])
+
+
+fit_predict.proxy_index = 0  # set by run_protocol before use
+
+
+def concordance_index(y_true, y_pred, max_pairs=2000000, seed=0):
+    """
+    Share of comparable pairs ranked in the right order (Harrell's C).
+
+    Over continuous outcomes it is a rescaling of Kendall's tau rather than an
+    independent signal, so read the two together rather than as two results.
+    Pairs are sampled when the exhaustive count would be too large.
+
+    Args:
+        y_true: True values.
+        y_pred: Predicted values.
+        max_pairs: Cap above which pairs are sampled instead of enumerated.
+        seed: Random seed for the sampling.
+
+    Returns:
+        Concordance index, or None when no pair is comparable.
+    """
+    n = len(y_true)
+    if n < 2:
+        return None
+
+    if n * (n - 1) // 2 <= max_pairs:
+        i, j = np.triu_indices(n, k=1)
+    else:
+        rng = np.random.default_rng(seed)
+        i = rng.integers(0, n, size=max_pairs)
+        j = rng.integers(0, n, size=max_pairs)
+        keep = i != j
+        i, j = i[keep], j[keep]
+
+    true_difference = y_true[i] - y_true[j]
+    comparable = true_difference != 0
+    if not comparable.any():
+        return None
+
+    predicted_difference = y_pred[i] - y_pred[j]
+    concordant = (np.sign(true_difference) == np.sign(predicted_difference)) \
+        & comparable
+    tied = (predicted_difference == 0) & comparable
+    return float((concordant.sum() + 0.5 * tied.sum()) / comparable.sum())
+
+
+def extended_metrics(y_true, y_pred, floor=1e-9):
+    """
+    Regression metrics, plus the rank and relative-error ones.
+
+    MAPE is undefined wherever the true WER is zero, which is a large share of
+    clean public segments, so it is computed on the non-zero subset only and
+    reported with the count it was computed on. Read it as a partial metric.
+
+    Args:
+        y_true: True values.
+        y_pred: Predicted values.
+        floor: Threshold below which a true value counts as zero.
+
+    Returns:
+        Metric dictionary.
+    """
+    from scipy.stats import kendalltau
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    metrics = regression_metrics(y_true, y_pred)
+    out = {k: round(float(metrics[k]), 4) for k in
+           ("MAE", "RMSE", "R2", "bias", "pearson", "spearman")}
+
+    nonzero = np.abs(y_true) > floor
+    out["MAPE"] = round(float(np.mean(
+        np.abs((y_pred[nonzero] - y_true[nonzero]) / y_true[nonzero]))), 4) \
+        if nonzero.any() else None
+    out["MAPE_n"] = int(nonzero.sum())
+
+    tau = kendalltau(y_true, y_pred)
+    out["kendall"] = round(float(tau.statistic), 4) \
+        if np.isfinite(tau.statistic) else None
+
+    c_index = concordance_index(y_true, y_pred)
+    out["c_index"] = round(c_index, 4) if c_index is not None else None
+    return out
+
+
+def corpus_wer_gap(y_pred, meta, index=None):
+    """
+    Compare the aggregate WER announced by the estimator with the true one.
+
+    The estimated corpus WER uses hypothesis words as denominator, since
+    references are unknown at inference time; the true one uses reference words.
+
+    Args:
+        y_pred: Predicted segment WER.
+        meta: Metadata arrays from design().
+        index: Optional subset of indices.
+
+    Returns:
+        Estimated WER, true WER and their absolute difference.
+    """
+    index = np.arange(len(y_pred)) if index is None else index
+    hyp_words = meta["n_hyp_words"][index]
+    estimated = float(np.sum(y_pred[index] * hyp_words) / np.sum(hyp_words))
+    true = float(np.sum(meta["label_errors"][index])
+                 / np.sum(meta["n_ref_words"][index]))
+    return {
+        "wer_corpus_estimated": round(estimated, 4),
+        "wer_corpus_true": round(true, 4),
+        "wer_corpus_gap": round(abs(estimated - true), 4),
+    }
+
+
+def run_protocol(rows, protocol="group", models=MODELS, blocks=("proxy", "text"),
+                 roles=PROXY_ROLES, feature_set="transferable", n_splits=5):
+    """
+    Run one protocol for every model and collect out-of-fold predictions.
+
+    Args:
+        rows: Labelled records.
+        protocol: One of "group", "lodo", "lolo", "loco".
+        models: Models to compare.
+        blocks: Feature blocks to include.
+        roles: Proxy ASR systems.
+        feature_set: "transferable" or "full".
+        n_splits: Number of folds for the "group" protocol.
+
+    Returns:
+        Out-of-fold predictions, per-fold scores and design metadata.
+    """
+    X, names, meta = design(rows, blocks, roles, feature_set)
+    fit_predict.proxy_index = proxy_column(names)
+    folds = splits(protocol, meta, n_splits)
+    y = meta["y"]
+
+    predictions = {model: np.zeros(len(y), dtype=float) for model in models}
+    fold_scores = []
+
+    for fold_name, train, test in folds:
+        entry = {"fold": fold_name, "n_train": int(train.size),
+                 "n_test": int(test.size),
+                 "wer_std_test": round(float(y[test].std()), 4)}
+        for model in models:
+            prediction = np.clip(
+                fit_predict(model, X, y, train, test, groups=meta["cv_group"]),
+                *WER_CLIP,
+            )
+            predictions[model][test] = prediction
+            entry[f"MAE_{model}"] = round(
+                float(np.mean(np.abs(prediction - y[test]))), 4)
+        fold_scores.append(entry)
+
+    return {
+        "protocol": protocol,
+        "feature_set": feature_set,
+        "feature_names": names,
+        "n_features": len(names),
+        "meta": meta,
+        "predictions": predictions,
+        "folds": fold_scores,
+    }
+
+
+def cluster_bootstrap(y_true, y_pred, groups, n_boot=1000, seed=0):
+    """
+    Confidence interval for the MAE, resampling groups rather than segments.
+
+    Segments of one group share a speaker and a channel, so they are not
+    independent; resampling groups keeps that dependence intact.
+
+    Args:
+        y_true: True WER.
+        y_pred: Predicted WER.
+        groups: Group labels.
+        n_boot: Number of bootstrap replicates.
+        seed: Random seed.
+
+    Returns:
+        Point estimate and 95 percent percentile interval.
+    """
+    rng = np.random.default_rng(seed)
+    unique = np.unique(groups)
+    index_of = {g: np.where(groups == g)[0] for g in unique}
+
+    values = []
+    for _ in range(n_boot):
+        drawn = rng.choice(unique, size=unique.size, replace=True)
+        index = np.concatenate([index_of[g] for g in drawn])
+        values.append(float(np.mean(np.abs(y_pred[index] - y_true[index]))))
+
+    return {
+        "MAE": round(float(np.mean(np.abs(y_pred - y_true))), 4),
+        "ci_low": round(float(np.percentile(values, 2.5)), 4),
+        "ci_high": round(float(np.percentile(values, 97.5)), 4),
+        "n_groups": int(unique.size),
+    }
+
+
+def paired_bootstrap(y_true, pred_a, pred_b, groups, n_boot=1000, seed=0):
+    """
+    Confidence interval for the MAE difference between two models.
+
+    Comparing two separate confidence intervals is the wrong test: they can
+    overlap while the paired difference is consistently in favour of one model,
+    because both are evaluated on the same segments and their errors move
+    together. Resampling the same groups for both models keeps that pairing.
+
+    Args:
+        y_true: True WER.
+        pred_a: Predictions of the reference model, usually the baseline.
+        pred_b: Predictions of the challenger.
+        groups: Group labels.
+        n_boot: Number of bootstrap replicates.
+        seed: Random seed.
+
+    Returns:
+        Observed difference MAE(a) - MAE(b) and its 95 percent interval.
+    """
+    rng = np.random.default_rng(seed)
+    unique = np.unique(groups)
+    index_of = {g: np.where(groups == g)[0] for g in unique}
+
+    differences = []
+    for _ in range(n_boot):
+        drawn = rng.choice(unique, size=unique.size, replace=True)
+        index = np.concatenate([index_of[g] for g in drawn])
+        mae_a = float(np.mean(np.abs(pred_a[index] - y_true[index])))
+        mae_b = float(np.mean(np.abs(pred_b[index] - y_true[index])))
+        differences.append(mae_a - mae_b)
+
+    observed = (float(np.mean(np.abs(pred_a - y_true)))
+                - float(np.mean(np.abs(pred_b - y_true))))
+    low = float(np.percentile(differences, 2.5))
+    high = float(np.percentile(differences, 97.5))
+    return {
+        "mae_difference": round(observed, 4),
+        "ci_low": round(low, 4),
+        "ci_high": round(high, 4),
+        "favours_b": bool(low > 0),
+    }
+
+
+def compare_models(result, reference="pwer", challenger="ridge", n_boot=1000):
+    """
+    Test whether the challenger beats the baseline on the same segments.
+
+    Args:
+        result: Output of run_protocol.
+        reference: Baseline model name.
+        challenger: Model name to test.
+        n_boot: Bootstrap replicates.
+
+    Returns:
+        Paired MAE difference with its interval.
+    """
+    meta = result["meta"]
+    return paired_bootstrap(meta["y"], result["predictions"][reference],
+                            result["predictions"][challenger],
+                            meta["cv_group"], n_boot=n_boot)
+
+
+def summarize(result, n_boot=500):
+    """
+    Build the comparison table of a protocol run.
+
+    Args:
+        result: Output of run_protocol.
+        n_boot: Bootstrap replicates, 0 to skip.
+
+    Returns:
+        One row of metrics per model.
+    """
+    meta = result["meta"]
+    y = meta["y"]
+    table = {}
+
+    for model, prediction in result["predictions"].items():
+        row = extended_metrics(y, prediction)
+        row.update(corpus_wer_gap(prediction, meta))
+        if n_boot:
+            interval = cluster_bootstrap(y, prediction, meta["cv_group"],
+                                         n_boot=n_boot)
+            row["MAE_ci"] = [interval["ci_low"], interval["ci_high"]]
+        table[model] = row
+
+    baseline = table.get("pwer", {}).get("MAE")
+    for model, row in table.items():
+        row["gain_vs_pwer"] = round(1.0 - row["MAE"] / baseline, 3) \
+            if baseline else None
+
+    return {
+        "protocol": result["protocol"],
+        "feature_set": result["feature_set"],
+        "n_features": result["n_features"],
+        "n_segments": int(len(y)),
+        "wer_mean": round(float(y.mean()), 4),
+        "wer_std": round(float(y.std()), 4),
+        "models": table,
+    }
+
+
+def ridge_export(rows, blocks=("proxy", "text"), roles=PROXY_ROLES,
+                 feature_set="transferable", alpha=None):
+    """
+    Fit the final ridge on the whole pool and export what internal code needs.
+
+    The returned dictionary is plain JSON: feature order, scaler statistics,
+    coefficients and intercept. No binary file to move.
+
+    Args:
+        rows: Labelled records.
+        blocks: Feature blocks to include.
+        roles: Proxy ASR systems.
+        feature_set: "transferable" or "full".
+        alpha: Fixed penalty, tuned by grouped search when None.
+
+    Returns:
+        Serializable model description.
+    """
+    X, names, meta = design(rows, blocks, roles, feature_set)
+    y, groups = meta["y"], meta["cv_group"]
+
+    pipeline = make_pipeline(StandardScaler(), Ridge())
+    if alpha is None:
+        search = GridSearchCV(pipeline, {"ridge__alpha": list(RIDGE_ALPHAS)},
+                              cv=GroupKFold(3),
+                              scoring="neg_mean_absolute_error")
+        search.fit(X, y, groups=groups)
+        pipeline = search.best_estimator_
+        alpha = float(pipeline.named_steps["ridge"].alpha)
+    else:
+        pipeline.set_params(ridge__alpha=alpha).fit(X, y)
+
+    scaler = pipeline.named_steps["standardscaler"]
+    ridge = pipeline.named_steps["ridge"]
+
+    return {
+        "feature_names": names,
+        "scaler_mean": [float(v) for v in scaler.mean_],
+        "scaler_scale": [float(v) for v in scaler.scale_],
+        "coef": [float(v) for v in ridge.coef_],
+        "intercept": float(ridge.intercept_),
+        "alpha": float(alpha),
+        "clip": list(WER_CLIP),
+        "blocks": list(blocks),
+        "roles": list(roles),
+        "feature_set": feature_set,
+        "n_train_segments": int(len(y)),
+        "train_wer_mean": round(float(y.mean()), 4),
+        "train_corpora": sorted(set(meta["corpus"].tolist())),
+        "train_langs": sorted(set(meta["lang"].tolist())),
+        "train_conditions": sorted(set(meta["condition"].tolist())),
+    }
+
+
+def apply_export(export, rows, blocks=None, roles=None):
+    """
+    Apply an exported ridge to new records, without scikit-learn.
+
+    This is the function to reimplement internally: it is a dot product.
+
+    Args:
+        export: Output of ridge_export.
+        rows: Records to score.
+        blocks: Feature blocks, taken from the export when None.
+        roles: Proxy ASR systems, taken from the export when None.
+
+    Returns:
+        Predicted WER per segment.
+    """
+    from features import build_features
+
+    blocks = tuple(blocks or export["blocks"])
+    roles = tuple(roles or export["roles"])
+    X, _, _, _, names = build_features(rows, blocks=blocks, roles=roles)
+    X = np.asarray(X, dtype=float)
+
+    index = {name: i for i, name in enumerate(names)}
+    missing = [n for n in export["feature_names"] if n not in index]
+    if missing:
+        raise ValueError(f"features missing from the records: {missing}")
+
+    columns = X[:, [index[n] for n in export["feature_names"]]]
+    standardized = (columns - np.array(export["scaler_mean"])) \
+        / np.array(export["scaler_scale"])
+    raw = standardized @ np.array(export["coef"]) + export["intercept"]
+    return np.clip(raw, *export["clip"])
+
+
+# --- transfer to internal data ------------------------------------------------
+
+
+def predict_calls_export(export, rows):
+    """
+    Rank calls with an exported ridge, without joblib and without sklearn.
+
+    Same output schema as deploy.predict_calls, so it is a drop-in replacement
+    for pipeline.rank when the model travelled as coefficients rather than as a
+    file.
+
+    Args:
+        export: Output of ridge_export.
+        rows: Records to score.
+
+    Returns:
+        One entry per call, worst estimated WER first.
+    """
+    estimates = apply_export(export, rows)
+    durations = np.array([r["duration"] for r in rows], dtype=float)
+    groups = np.array([r["sample_id"] for r in rows])
+
+    results = []
+    for call in sorted(set(groups)):
+        mask = groups == call
+        weight = durations[mask].sum()
+        if weight <= 0:
+            continue
+        results.append({
+            "call": call,
+            "n_segments": int(mask.sum()),
+            "duration_s": round(float(weight), 1),
+            "wer_estimated": round(
+                float(np.sum(estimates[mask] * durations[mask]) / weight), 4),
+        })
+    results.sort(key=lambda item: -item["wer_estimated"])
+    return results
+
+
+def _aggregate_calls(y, prediction, rows, reference="duration"):
+    """
+    Aggregate segment values into call values.
+
+    The prediction is always aggregated the way deploy.predict_calls does it,
+    weighting segment estimates by duration. The reference has two defensible
+    forms and they do not give the same number:
+
+      "words"    total errors over total reference words, the definition of a
+                 call's WER. Comparing against it measures the end-to-end
+                 operational error, aggregation mismatch included.
+      "duration" duration-weighted mean of segment WER, mirroring how the
+                 estimates are aggregated. Comparing against it isolates the
+                 model error from the choice of weighting.
+
+    Args:
+        y: True segment WER.
+        prediction: Predicted segment WER.
+        rows: Records, providing duration, sample_id and reference counts.
+        reference: "words" or "duration".
+
+    Returns:
+        True and predicted WER per call.
+    """
+    if reference not in ("words", "duration"):
+        raise ValueError(f"unknown reference {reference}")
+
+    durations = np.array([r["duration"] for r in rows], dtype=float)
+    errors = np.array([r["label_errors"] for r in rows], dtype=float)
+    ref_words = np.array([r["n_ref_words"] for r in rows], dtype=float)
+    groups = np.array([r["sample_id"] for r in rows])
+
+    true_values, predicted_values = [], []
+    for call in sorted(set(groups)):
+        mask = groups == call
+        weight = durations[mask].sum()
+        if weight <= 0:
+            continue
+        if reference == "duration":
+            true_values.append(float(np.sum(y[mask] * durations[mask]) / weight))
+        else:
+            total_words = ref_words[mask].sum()
+            if total_words <= 0:
+                continue
+            true_values.append(float(errors[mask].sum() / total_words))
+        predicted_values.append(
+            float(np.sum(prediction[mask] * durations[mask]) / weight))
+    return np.array(true_values), np.array(predicted_values)
+
+
+def transfer_report(export, rows, roles=PROXY_ROLES, n_boot=500):
+    """
+    Score an exported ridge on labelled records it was not trained on.
+
+    Reported next to the raw proxy disagreement, so that the transfer is judged
+    against the baseline a practitioner would use without any model.
+
+    calibration_slope is the ordinary least squares slope of the true WER
+    regressed on the predicted one, the standard external-validation
+    diagnostic: 1 means the dynamic range is preserved, below 1 means the
+    predictions are too spread out, above 1 means they are compressed.
+
+    Args:
+        export: Output of ridge_export.
+        rows: Labelled records from the target domain.
+        roles: Proxy ASR systems.
+        n_boot: Bootstrap replicates, 0 to skip.
+
+    Returns:
+        Segment-level and call-level metrics for the ridge and the baseline.
+    """
+    from features import proxy_features
+
+    y = np.array([r["label_wer"] for r in rows], dtype=float)
+    ridge_prediction = apply_export(export, rows)
+    proxy_prediction = np.clip(
+        np.array([proxy_features(r, roles).get("pwer_mean", 0.0) for r in rows],
+                 dtype=float), *WER_CLIP)
+
+    meta = {
+        "n_hyp_words": np.array([max(r.get("n_hyp_words", 0), 1) for r in rows],
+                                dtype=float),
+        "n_ref_words": np.array([r["n_ref_words"] for r in rows], dtype=float),
+        "label_errors": np.array([r["label_errors"] for r in rows], dtype=float),
+    }
+    groups = np.array([r["sample_id"] for r in rows])
+
+    report = {
+        "n_segments": len(rows),
+        "n_calls": int(len(set(groups))),
+        "wer_mean": round(float(y.mean()), 4),
+        "wer_std": round(float(y.std()), 4),
+        "trained_on": {
+            "corpora": export.get("train_corpora"),
+            "langs": export.get("train_langs"),
+            "conditions": export.get("train_conditions"),
+            "n_segments": export.get("n_train_segments"),
+            "wer_mean": export.get("train_wer_mean"),
+        },
+        "segment": {},
+        "call": {},
+    }
+
+    for name, prediction in (("ridge", ridge_prediction),
+                             ("pwer", proxy_prediction)):
+        metrics = regression_metrics(y, prediction)
+        entry = {k: round(metrics[k], 4) for k in
+                 ("MAE", "RMSE", "R2", "bias", "pearson", "spearman")}
+        entry.update(corpus_wer_gap(prediction, meta))
+        slope, intercept = np.polyfit(prediction, y, 1)
+        entry["calibration_slope"] = round(float(slope), 3)
+        entry["calibration_intercept"] = round(float(intercept), 4)
+        if n_boot:
+            interval = cluster_bootstrap(y, prediction, groups, n_boot=n_boot)
+            entry["MAE_ci"] = [interval["ci_low"], interval["ci_high"]]
+        report["segment"][name] = entry
+
+        true_calls, predicted_calls = _aggregate_calls(y, prediction, rows)
+        if true_calls.size >= 3:
+            call_metrics_values = regression_metrics(true_calls, predicted_calls)
+            report["call"][name] = {
+                k: round(call_metrics_values[k], 4) for k in
+                ("MAE", "RMSE", "R2", "bias", "pearson", "spearman")
+            }
+
+    return report
+
+
+def fit_bundle(rows, model="ridge", blocks=("proxy", "text"), roles=PROXY_ROLES,
+               feature_set="transferable", norm_config=None, seed=0, notes=""):
+    """
+    Train any regressor on a pool and return a bundle usable by deploy.
+
+    This is the alternative to exporting ridge coefficients: when the
+    transcription files themselves have been copied to the internal machine,
+    the model can simply be retrained there, with no weights to transport and
+    no restriction to linear models.
+
+    The returned dictionary has the same shape as deploy.fit_final, so
+    deploy.predict, deploy.predict_calls and pipeline.rank accept it as is.
+
+    Args:
+        rows: Labelled records.
+        model: Model name from MODELS, baselines included.
+        blocks: Feature blocks to include.
+        roles: Proxy ASR systems.
+        feature_set: "transferable" or "full".
+        norm_config: Normalization settings.
+        seed: Random seed.
+        notes: Free-form provenance note.
+
+    Returns:
+        Trained bundle.
+    """
+    X, names, meta = design(rows, blocks, roles, feature_set)
+    y, groups = meta["y"], meta["cv_group"]
+    estimator = _tuned_fit(model, X, y, np.arange(len(y)), groups, seed,
+                           proxy_index=proxy_column(names))
+
+    return {
+        "bundle_version": 1,
+        "estimator": estimator,
+        "best_params": dict(getattr(estimator, "best_params_", {})),
+        "feature_names": names,
+        "blocks": tuple(blocks),
+        "roles": tuple(roles),
+        "target": "wer",
+        "model": model,
+        "feature_set": feature_set,
+        "norm_config": dict(norm_config or {}),
+        "n_train_segments": len(rows),
+        "n_train_calls": len({r["sample_id"] for r in rows}),
+        "train_wer_mean": float(np.mean(y)),
+        "train_corpora": sorted(set(meta["corpus"].tolist())),
+        "train_langs": sorted(set(meta["lang"].tolist())),
+        "train_conditions": sorted(set(meta["condition"].tolist())),
+        "notes": notes,
+    }
+
+
+def _resolve_k(k_values, n, n_bad):
+    """
+    Turn review budgets into segment counts.
+
+    Args:
+        k_values: Budgets, a fraction of n when below 1, a count otherwise.
+        n: Number of items.
+        n_bad: Number of truly bad items.
+
+    Returns:
+        Sorted distinct counts, including n_bad so that precision at k can be
+        read against the best achievable value for that budget.
+    """
+    counts = set()
+    for value in k_values:
+        counts.add(int(round(value * n)) if 0 < value < 1 else int(value))
+    if n_bad > 0:
+        counts.add(int(n_bad))
+    return sorted(c for c in counts if 0 < c <= n)
+
+
+def classification_report(y_true, y_pred, thresholds=(BAD_THRESHOLD,),
+                          k_values=(0.1, 0.2)):
+    """
+    Screening metrics at one or more decision thresholds.
+
+    Wraps evaluate.binary_metrics and evaluate.precision_at_k, so the scores are
+    exactly those already used on internal data. The threshold is an operating
+    point, not a property of the model: pass several to see how the trade-off
+    moves before fixing one.
+
+    Args:
+        y_true: True WER.
+        y_pred: Predicted WER.
+        thresholds: WER above which an item counts as bad.
+        k_values: Review budgets for precision at k.
+
+    Returns:
+        One entry per threshold, keyed by its value.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    report = {}
+    for threshold in thresholds:
+        entry, matrix = binary_metrics(y_true, y_pred, threshold=threshold)
+        entry = {k: (round(v, 4) if isinstance(v, float) else v)
+                 for k, v in entry.items()}
+        entry["confusion_matrix"] = {
+            "tn": int(matrix[0, 0]), "fp": int(matrix[0, 1]),
+            "fn": int(matrix[1, 0]), "tp": int(matrix[1, 1]),
+        }
+        n_bad = int((y_true > threshold).sum())
+        entry["top_k"] = [
+            {k: (round(v, 4) if isinstance(v, float) else v)
+             for k, v in precision_at_k(y_true, y_pred, k, threshold).items()}
+            for k in _resolve_k(k_values, len(y_true), n_bad)
+        ]
+        report[f"{threshold:g}"] = entry
+
+    return report
+
+
+def evaluate_bundle(bundle, rows, levels=("segment", "call"), n_boot=500,
+                    call_reference="both", thresholds=(BAD_THRESHOLD,),
+                    k_values=(0.1, 0.2)):
+    """
+    Score a trained bundle on labelled records, at segment level, call level, or both.
+
+    The two levels answer different questions and can disagree. The segment
+    level says how accurate a single estimate is; the call level says whether
+    the duration-weighted aggregation lands on the right value and ranks calls
+    correctly, which is the operational use.
+
+    Only the bundle is scored. To compare against a baseline, build it with
+    fit_bundle(rows, model="pwer") or model="mean" and score it the same way.
+
+    Args:
+        bundle: Bundle from fit_bundle or deploy.fit_final.
+        rows: Labelled records.
+        levels: Any of "segment" and "call".
+        n_boot: Bootstrap replicates for the segment level, 0 to skip.
+        call_reference: "words", "duration" or "both", see _aggregate_calls.
+        thresholds: WER above which an item counts as bad, for the screening
+            metrics. Pass several to compare operating points.
+        k_values: Review budgets for precision at k, fractions or counts.
+
+    Returns:
+        Metrics per requested level, regression and classification. The call
+        section is keyed by reference.
+    """
+    from deploy import predict as deploy_predict
+
+    y = np.array([r["label_wer"] for r in rows], dtype=float)
+    prediction = np.clip(deploy_predict(bundle, rows), *WER_CLIP)
+    groups = np.array([r["sample_id"] for r in rows])
+
+    report = {
+        "model": bundle.get("model"),
+        "feature_set": bundle.get("feature_set"),
+        "n_segments": len(rows),
+        "n_calls": int(len(set(groups))),
+        "wer_mean": round(float(y.mean()), 4),
+        "wer_std": round(float(y.std()), 4),
+    }
+
+    if "segment" in levels:
+        meta = {
+            "n_hyp_words": np.array(
+                [max(r.get("n_hyp_words", 0), 1) for r in rows], dtype=float),
+            "n_ref_words": np.array([r["n_ref_words"] for r in rows],
+                                    dtype=float),
+            "label_errors": np.array([r["label_errors"] for r in rows],
+                                     dtype=float),
+        }
+        entry = extended_metrics(y, prediction)
+        entry.update(corpus_wer_gap(prediction, meta))
+        if n_boot:
+            interval = cluster_bootstrap(y, prediction, groups, n_boot=n_boot)
+            entry["MAE_ci"] = [interval["ci_low"], interval["ci_high"]]
+        report["segment"] = {
+            "regression": entry,
+            "classification": classification_report(y, prediction, thresholds,
+                                                    k_values),
+        }
+
+    if "call" in levels:
+        references = ("words", "duration") if call_reference == "both" \
+            else (call_reference,)
+        report["call"] = {}
+        for reference in references:
+            true_calls, predicted_calls = _aggregate_calls(
+                y, prediction, rows, reference=reference)
+            if true_calls.size < 3:
+                report["call"][f"vs_{reference}"] = {
+                    "n_calls": int(true_calls.size),
+                    "note": "too few calls to score"}
+                continue
+            entry = extended_metrics(true_calls, predicted_calls)
+            entry["wer_call_mean"] = round(float(true_calls.mean()), 4)
+            entry["wer_call_std"] = round(float(true_calls.std()), 4)
+            report["call"][f"vs_{reference}"] = {
+                "regression": entry,
+                "classification": classification_report(
+                    true_calls, predicted_calls, thresholds, k_values),
+            }
+
+    return report
+
+
+def true_wer(rows, level="call"):
+    """
+    Return the reference WER in the same shape as pipeline.rank, for joining.
+
+    Keys match rank's output, with wer_true in place of wer_estimated, so the
+    two tables can be merged on call or segment_id and read side by side.
+
+    At call level two aggregations are returned. wer_true is the definition of
+    a call's WER, total errors over total reference words. wer_true_duration is
+    the duration-weighted mean of segment WER, which is how deploy.predict_calls
+    aggregates its estimates: compare against that one when judging the
+    estimator, and against wer_true when reporting the real quality of a call.
+
+    Args:
+        rows: Labelled records.
+        level: "call", "segment", or "both".
+
+    Returns:
+        Call entries, segment entries, or a dict holding both.
+    """
+    if level not in ("call", "segment", "both"):
+        raise ValueError(f"unknown level {level}, expected call, segment or both")
+
+    segments = None
+    if level in ("segment", "both"):
+        segments = [
+            {"segment_id": row["segment_id"], "call": row["sample_id"],
+             "duration_s": round(float(row["duration"]), 1),
+             "n_ref_words": int(row["n_ref_words"]),
+             "errors": int(row["label_errors"]),
+             "wer_true": round(float(row["label_wer"]), 4)}
+            for row in rows
+        ]
+        segments.sort(key=lambda item: -item["wer_true"])
+
+    if level == "segment":
+        return segments
+
+    by_call = {}
+    for row in rows:
+        entry = by_call.setdefault(row["sample_id"], {
+            "call": row["sample_id"], "n_segments": 0, "duration_s": 0.0,
+            "errors": 0, "n_ref_words": 0, "weighted_wer": 0.0})
+        entry["n_segments"] += 1
+        entry["duration_s"] += float(row["duration"])
+        entry["errors"] += int(row["label_errors"])
+        entry["n_ref_words"] += int(row["n_ref_words"])
+        entry["weighted_wer"] += float(row["label_wer"]) * float(row["duration"])
+
+    calls = []
+    for entry in by_call.values():
+        duration = entry["duration_s"]
+        calls.append({
+            "call": entry["call"],
+            "n_segments": entry["n_segments"],
+            "duration_s": round(duration, 1),
+            "n_ref_words": entry["n_ref_words"],
+            "errors": entry["errors"],
+            "wer_true": round(entry["errors"] / entry["n_ref_words"], 4)
+            if entry["n_ref_words"] else None,
+            "wer_true_duration": round(entry["weighted_wer"] / duration, 4)
+            if duration > 0 else None,
+        })
+    calls.sort(key=lambda item: -(item["wer_true"] or 0.0))
+
+    return calls if level == "call" else {"call": calls, "segment": segments}
+
+
+def metrics_by_stratum(result, key="condition", models=None):
+    """
+    Break the out-of-fold metrics down by condition, corpus or language.
+
+    Pooled metrics hide how performance depends on how dispersed the WER is in
+    each subset. MAE is expressed in WER units, so it grows mechanically where
+    the WER itself is larger and cannot be compared across strata on its own.
+    R2 is the variance-normalized counterpart, R2 = 1 - (RMSE / sigma)^2, so it
+    is the one to compare across strata; sigma is reported next to it either
+    way.
+
+    Args:
+        result: Output of run_protocol.
+        key: Metadata field to group by: "condition", "corpus" or "lang".
+        models: Models to report, all of them when None.
+
+    Returns:
+        Metrics per stratum and per model.
+    """
+    meta = result["meta"]
+    if key not in meta:
+        raise ValueError(f"unknown key {key}, expected condition, corpus or lang")
+
+    values = meta[key]
+    y = meta["y"]
+    models = models or list(result["predictions"])
+
+    table = {}
+    for stratum in sorted(set(values.tolist())):
+        index = np.where(values == stratum)[0]
+        entry = {
+            "n": int(index.size),
+            "wer_mean": round(float(y[index].mean()), 4),
+            "wer_std": round(float(y[index].std()), 4),
+            "models": {},
+        }
+        for model in models:
+            prediction = result["predictions"][model][index]
+            scores = extended_metrics(y[index], prediction)
+            scores.update(corpus_wer_gap(result["predictions"][model], meta,
+                                         index=index))
+            entry["models"][model] = scores
+        table[str(stratum)] = entry
+
+    return {"protocol": result["protocol"], "key": key, "strata": table}
+
+
+def fitted_model(bundle, unwrap_pipeline=False):
+    """
+    Return the fitted estimator held by a bundle.
+
+    Models with a hyperparameter grid are wrapped in a GridSearchCV, so the
+    object stored in the bundle is the search, not the model. This unwraps it.
+
+    Args:
+        bundle: Bundle from fit_bundle.
+        unwrap_pipeline: Also return the final step of a pipeline, dropping the
+            scaler. Note that the model alone then expects standardized input.
+
+    Returns:
+        Fitted estimator.
+    """
+    estimator = bundle["estimator"]
+    if hasattr(estimator, "best_estimator_"):
+        estimator = estimator.best_estimator_
+    if unwrap_pipeline and hasattr(estimator, "steps"):
+        estimator = estimator.steps[-1][1]
+    return estimator
+
+
+def design_for(bundle, rows):
+    """
+    Build a feature matrix aligned with a bundle, in scikit-learn layout.
+
+    Columns follow bundle["feature_names"] exactly, so the matrix can be fed to
+    the fitted estimator, to a SHAP explainer or to any scikit-learn utility.
+
+    Args:
+        bundle: Bundle from fit_bundle.
+        rows: Records to encode.
+
+    Returns:
+        Feature matrix, WER labels and feature names.
+    """
+    from features import build_features
+
+    X, _, y_wer, _, names = build_features(
+        rows, blocks=tuple(bundle["blocks"]), roles=tuple(bundle["roles"]))
+    X = np.asarray(X, dtype=float)
+
+    index = {name: i for i, name in enumerate(names)}
+    missing = [n for n in bundle["feature_names"] if n not in index]
+    if missing:
+        raise ValueError(f"features missing from the records: {missing}")
+
+    columns = [index[name] for name in bundle["feature_names"]]
+    return X[:, columns], np.asarray(y_wer, dtype=float), \
+        list(bundle["feature_names"])
