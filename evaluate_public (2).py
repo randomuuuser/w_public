@@ -1144,3 +1144,19 @@ def metrics_by_stratum(result, key="condition", models=None):
         table[str(stratum)] = entry
 
     return {"protocol": result["protocol"], "key": key, "strata": table}
+
+
+
+
+# import evaluate_public as ep, json
+
+# report = ep.evaluate_bundle(bundle, rows_internal,
+#                             thresholds=(0.15, 0.25, 0.35),
+#                             k_values=(0.1, 0.2))
+# print(json.dumps(report, indent=1))
+
+# report["segment"]["regression"]                  # comme avant
+# report["segment"]["classification"]["0.25"]      # ROC_AUC, PR_AUC, F1, MCC...
+# report["segment"]["classification"]["0.25"]["confusion_matrix"]   # tn/fp/fn/tp
+# report["segment"]["classification"]["0.25"]["top_k"]              # precision@k, lift
+# report["call"]["vs_words"]["classification"]["0.25"]
