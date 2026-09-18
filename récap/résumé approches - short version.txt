@@ -1,0 +1,117 @@
+# Évaluation de l'estimateur de WER sans référence
+## Synthèse méthodologique
+
+---
+
+### Le fil
+
+L'estimateur donne de bons résultats en interne, mais sur trop peu d'appels et
+avec une variance de WER trop faible pour être jugés. D'où trois étapes
+enchaînées, chacune conditionnée par la précédente :
+
+**Bloc 2 — le dispositif est-il valide ?** Espagnol seul, 1 200 segments, ~4 h
+d'audio. On vérifie que la chaîne publique produit des WER crédibles, et surtout
+qu'une dégradation acoustique contrôlée élargit la plage de WER et désaccorde les
+systèmes ASR. Sans ça, rien n'est mesurable et l'étape suivante n'a pas lieu.
+
+**Bloc 3 — l'estimateur généralise-t-il ?** 5 langues (es, pt, en, fr, de),
+4 000 segments, ~18 h d'audio. On retire tour à tour un axe de variation de
+l'entraînement pour mesurer la dégradation hors distribution.
+
+**Transfert — tient-il sur le domaine cible ?** Entraînement sur données
+publiques, test sur les appels internes.
+
+---
+
+### Dispositif
+
+Trois corpus publics (FLEURS, MLS, VoxPopuli), **splits de test uniquement** :
+leurs splits d'entraînement ont servi à entraîner les modèles ASR, les inclure
+fausserait les WER de référence. La couverture linguistique varie selon le corpus.
+
+Le **triplet ASR est identique en public et en interne** (parakeet-tdt-v3 en
+cible, canary-1b-v2 et whisper-large-v3 en proxys). Un seul facteur varie donc
+entre entraînement et test final : le domaine. Le résultat de transfert est
+attribuable sans ambiguïté.
+
+Deux conditions acoustiques transcrites : `clean` et `noise_snr5` (bruit additif
+à 5 dB, déterministe, famille de perturbation issue de Waheed et al., Findings
+ACL 2025).
+
+---
+
+### Garde-fous
+
+- **Validation croisée groupée** : deux segments d'un même groupe ne peuvent pas
+  se répartir entre train et test. Sur FLEURS le groupe est l'empreinte de la
+  référence, la même phrase FLoRes y étant lue par plusieurs locuteurs.
+- **Aucun appel artificiel** : agréger des enregistrements hétérogènes pour
+  simuler un appel détruirait la corrélation intra-appel et produirait une
+  métrique non falsifiable. L'évaluation publique reste au niveau segment ; le
+  niveau appel n'est mesuré qu'en interne, où les appels sont réels.
+- **Features transférables** : grandeurs sans échelle uniquement. Durées, comptes
+  absolus et rôle du locuteur sont exclus, leur valeur dépendant du corpus.
+
+---
+
+### Protocoles
+
+| protocole | axe retiré du train | régime |
+|---|---|---|
+| **group** | rien | IID |
+| **LODO** (*Leave-One-Dataset-Out*) | un corpus | OOD domaine |
+| **LOLO** (*Leave-One-Language-Out*) | une langue | OOD langue |
+| **LOCO** (*Leave-One-Condition-Out*) | une condition acoustique | OOD acoustique |
+
+LODO reprend le protocole de Waheed et al. ; LOLO teste le transfert cross-lingue,
+également étudié par eWER3 (Chowdhury et Ali, 2023).
+
+---
+
+### Comparaison contrôlée
+
+Six modèles : deux baselines — moyenne du train, et désaccord proxy brut utilisé
+directement comme estimation (équivalent du « W PROXY » du papier) — puis ridge,
+lasso, HGB et XGBoost, tous réglés en folds groupés internes. La baseline proxy
+est la barre décisive : un modèle qui ne la bat pas n'apporte rien.
+
+Trois familles de métriques, qui ne répondent pas à la même question : **erreur**
+(MAE, RMSE), **rang** (Spearman, Kendall, concordance), **biais** (biais moyen,
+écart de WER agrégé — un biais, pas une dispersion, donc non redondant avec la
+MAE). Le R² étant sensible à la dispersion du jeu de test, il est toujours
+reporté avec l'écart-type du WER du sous-ensemble évalué.
+
+---
+
+### Robustesse statistique
+
+- **Bootstrap groupé** plutôt que par segment : les segments d'un même groupe
+  partagent locuteur et canal, ils ne sont pas indépendants.
+- **Bootstrap apparié** pour comparer deux modèles : comparer deux intervalles
+  séparés est un test incorrect, seul l'intervalle de la différence tranche.
+- **Analyse stratifiée** par condition, corpus et langue, chaque strate avec son
+  σ — c'est ce qui permet de lire la performance dans un régime de dispersion
+  comparable à celui des corpus internes.
+
+---
+
+### Transfert interne
+
+Les transcriptions publiques (texte seul) sont copiées dans une arborescence
+interne identique et le régresseur est réentraîné sur place, sans contrainte de
+famille de modèle. **Aucune recalibration** : l'objectif est la généralisation
+brute, une correction affine du niveau fausserait la mesure.
+
+Évaluation aux deux niveaux. Au niveau appel, deux références distinctes :
+erreurs totales sur mots de référence totaux (erreur opérationnelle) et moyenne
+pondérée par la durée (erreur du modèle seule, hors choix d'agrégation).
+
+---
+
+### Pistes identifiées, non explorées
+
+Leave-one-system-out (permuter le rôle de cible entre les trois ASR, coût nul) ·
+winsorisation du WER, non borné sur références courtes · sélection empirique de
+features, le jeu transférable étant défini a priori · autres dégradations déjà
+implémentées mais non transcrites (réverbération, canal téléphonique 8 kHz, bruit
+à spectre de parole) · indicateur de transcription vérifiée de VoxPopuli.

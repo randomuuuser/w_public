@@ -1,0 +1,287 @@
+```markdown
+# Protocole d'évaluation de l'estimateur de WER sans référence
+## Récapitulatif méthodologique — blocs 2 et 3
+
+---
+
+## 1. Question posée
+
+L'estimateur de WER développé en interne donne de bons résultats, mais ils sont
+difficiles à juger : peu d'appels annotés, et une variance du WER trop faible pour
+que les métriques soient interprétables.
+
+Les données publiques servent à répondre à une question précise :
+**l'estimateur fonctionne-t-il encore quand les données de test ne proviennent pas
+de la distribution d'entraînement ?**
+
+---
+
+## 2. Principes méthodologiques retenus
+
+Cinq principes appliqués de bout en bout :
+
+1. **Splits de test uniquement.** Les splits d'entraînement de FLEURS, MLS et
+   VoxPopuli ont servi à entraîner les modèles ASR utilisés (cible et proxys).
+   Les utiliser fausserait les WER de référence.
+2. **Aucune fuite entre folds.** Chaque segment porte un identifiant de groupe et
+   les segments d'un même groupe restent dans le même fold.
+3. **Baselines systématiques.** Tout résultat est reporté à côté de deux
+   références, faute de quoi un chiffre n'est pas interprétable.
+4. **Reproductibilité.** Dégradations déterministes par graine dérivée de
+   l'identifiant du segment ; caches append-only reprenables après interruption.
+5. **Variance contrôlée.** Plutôt que de subir une dispersion du WER trop faible,
+   on la produit par dégradation acoustique calibrée.
+
+---
+
+## 3. Chaîne de données
+
+```
+corpus public (streaming HF, split test)
+   -> dégradation acoustique déterministe (ou "clean")
+   -> WAV mono 16 kHz
+   -> transcription par 3 systèmes ASR
+   -> normalisation identique à celle du pipeline interne
+   -> calcul des labels WER contre la référence
+   -> features -> évaluation
+```
+
+Le schéma des enregistrements produits est **identique** à celui du pipeline
+interne. Les modules existants (transcription, fusion, features, évaluation,
+déploiement) fonctionnent sans modification sur les données publiques.
+
+### Corpus
+
+| corpus | nature | unité de session |
+|---|---|---|
+| FLEURS | parole lue, propre | aucune |
+| MLS | livres audio | chapitre (enregistrement continu) |
+| VoxPopuli | parlementaire, spontanée | locuteur |
+
+Écartés : Common Voice (retiré de HF), Primock57 (données simulées),
+Earnings-22 et AMI (dépôts HF non officiels).
+
+### Deux identifiants distincts, deux usages
+
+- **`group_id`** — unité de validation croisée. Jamais d'agrégation, uniquement
+  du partitionnement. Sur FLEURS il s'agit de l'empreinte de la référence
+  normalisée, car la même phrase FLoRes est lue par plusieurs locuteurs : sans
+  cela, deux lectures d'une même phrase se retrouveraient dans deux folds
+  différents et les features texte fuiteraient.
+- **`sample_id`** — unité d'agrégation. Renseignée uniquement quand le corpus
+  expose une session réelle.
+
+**Aucun appel artificiel n'a été construit.** Regrouper des enregistrements
+hétérogènes pour simuler un appel supprimerait la corrélation intra-appel qui
+fait qu'un appel est une unité d'analyse, et produirait une métrique non
+falsifiable. L'évaluation publique est donc menée **au niveau segment** ; le
+niveau appel est réservé aux données internes, où les appels sont réels.
+
+### Filtre de longueur
+
+`min_ref_words = 0`, identique au réglage interne, pour que les chiffres publics
+et internes restent comparables.
+
+---
+
+## 4. Dégradation acoustique
+
+Deux conditions transcrites : **`clean`** et **`noise_snr5`** (bruit blanc
+gaussien additif à un rapport signal/bruit de 5 dB).
+
+Provenance : le bruit additif à SNR contrôlé fait partie des familles de
+perturbations utilisées par Waheed et al. (Findings ACL 2025). La recette de
+référence du domaine emploie du bruit enregistré (MUSAN), écartée ici pour des
+raisons de volume de stockage.
+
+Double objectif :
+- **élargir la plage de WER** pour rendre les métriques interprétables ;
+- **désaccorder les systèmes ASR**, et donc restaurer le signal exploité par la
+  méthode, mesuré par le taux de segments où les proxys s'accordent alors que la
+  cible se trompe.
+
+Autres transformations implémentées mais non transcrites : réverbération
+(modèle de décroissance exponentielle de Polack), canal téléphonique 8 kHz avec
+companding µ-law G.711, bruit à spectre de parole, écho, saturation.
+
+---
+
+## 5. Systèmes ASR
+
+| rôle | modèle |
+|---|---|
+| cible | parakeet-tdt-0.6b-v3 |
+| proxy A | canary-1b-v2 |
+| proxy B | whisper-large-v3 |
+
+**Triplet identique en public et en interne.** C'est ce qui rend le test de
+transfert interprétable : un seul facteur varie entre l'entraînement public et le
+test interne, le domaine.
+
+Contrainte pratique : les trois modèles ont des dépendances incompatibles. La
+transcription se fait donc en trois étapes séparées, chacune avec son
+environnement, la reprise sur cache rendant l'opération interruptible.
+
+---
+
+## 6. Protocoles d'évaluation
+
+Quatre protocoles, chacun retirant un axe de variation de l'entraînement. Les
+trois derniers sont hors distribution.
+
+| sigle | signification | ce qui est retiré du train | question |
+|---|---|---|---|
+| **group** | validation croisée groupée | rien (in-distribution) | le modèle apprend-il quelque chose ? |
+| **LODO** | *Leave-One-Dataset-Out* | un corpus entier | tient-il sur un corpus jamais vu ? |
+| **LOLO** | *Leave-One-Language-Out* | une langue entière | tient-il sur une langue jamais vue ? |
+| **LOCO** | *Leave-One-Condition-Out* | une condition acoustique | tient-il sur un régime acoustique jamais vu ? |
+
+LODO reprend le protocole de Waheed et al. LOLO teste le transfert cross-lingue,
+également étudié par eWER3 (Chowdhury et Ali, 2023).
+
+---
+
+## 7. Modèles comparés
+
+| modèle | rôle |
+|---|---|
+| `mean` | baseline : prédit la moyenne du train. Un R² positif doit battre ceci. |
+| `pwer` | baseline : désaccord brut entre cible et proxys utilisé directement comme estimation du WER. Correspond au baseline « W PROXY » de Waheed et al. |
+| `ridge`, `lasso` | linéaires régularisés, standardisés, pénalité réglée par recherche sur grille en folds groupés internes |
+| `hgb`, `xgb` | ensembles d'arbres, hyperparamètres réglés sur grille |
+
+Le baseline `pwer` est la barre décisive : si un modèle ne le bat pas, la
+régression n'apporte rien.
+
+Deux écarts assumés avec le papier de référence, à ne pas confondre au moment de
+comparer les chiffres :
+- leur baseline utilise **un seul** proxy, le nôtre en moyenne **deux**, donc
+  notre barre est plus haute ;
+- leurs erreurs absolues sont exprimées en **nombre de mots**, les nôtres en
+  **taux de WER** : les deux échelles ne se comparent pas directement.
+
+### Jeu de features
+
+Deux jeux comparables. Le jeu dit **transférable** ne retient que les grandeurs
+sans échelle (ratios et taux), en excluant durées, comptes absolus et rôle du
+locuteur, dont la valeur dépend du corpus. 22 features.
+
+---
+
+## 8. Métriques
+
+| famille | métriques | ce qu'elles mesurent |
+|---|---|---|
+| erreur | MAE, RMSE, MAPE | écart typique entre estimation et vérité |
+| variance expliquée | R² | erreur rapportée à la dispersion du jeu de test |
+| rang | Spearman, Kendall, indice de concordance | capacité à classer, indépendamment du niveau |
+| biais | biais moyen, écart de WER de corpus | décalage systématique |
+
+Points de méthode :
+
+- **L'écart de WER de corpus n'est pas redondant avec la MAE.** La MAE est une
+  dispersion, l'écart de corpus est un biais : les erreurs segment par segment se
+  compensent dans l'agrégat. C'est la métrique qui correspond à l'usage métier
+  (« l'outil annonce 22 %, la vérité est 24 % »). Waheed et al. comparent WER et
+  aWER au niveau dataset, eWER3 rapporte le même agrégat.
+- **Le R² dépend mécaniquement de la dispersion du jeu de test**, puisque
+  R² = 1 − (RMSE/σ)². Il est donc toujours reporté avec l'écart-type du WER du
+  sous-ensemble évalué.
+- **La MAPE est partielle** : indéfinie quand le WER vrai vaut zéro, ce qui
+  concerne une large part des segments propres. Calculée sur le sous-ensemble non
+  nul, avec son effectif.
+- **Kendall et indice de concordance ne sont pas indépendants** sur des valeurs
+  continues : ils se lisent ensemble.
+
+---
+
+## 9. Tests statistiques
+
+Deux procédures de rééchantillonnage, l'une et l'autre par **groupes** et non par
+segments, car les segments d'un même groupe partagent locuteur et canal et ne
+sont donc pas indépendants.
+
+- **Bootstrap groupé** : intervalle de confiance à 95 % sur la MAE de chaque
+  modèle.
+- **Bootstrap apparié** : intervalle sur la **différence** de MAE entre deux
+  modèles, sur les mêmes segments rééchantillonnés. Comparer deux intervalles
+  séparés est un test incorrect : ils peuvent se chevaucher alors que la
+  différence appariée est systématiquement du même signe.
+
+---
+
+## 10. Analyse stratifiée
+
+Les métriques agrégées masquent la dépendance à la dispersion. Elles sont donc
+ventilées par **condition acoustique**, par **corpus** et par **langue**, chaque
+strate étant reportée avec son écart-type de WER.
+
+C'est ce qui permet de lire la performance dans un régime de dispersion
+comparable à celui des corpus internes, plutôt que dans la moyenne d'un pool
+artificiellement élargi.
+
+---
+
+## 11. Transfert vers les données internes
+
+Deux voies, testées indépendamment.
+
+**Route A — copie des transcriptions.** Les fichiers de transcription publics
+(texte uniquement, quelques Mo, aucun audio, aucun poids) sont copiés dans une
+arborescence interne identique. Le régresseur est réentraîné sur place, ce qui
+lève toute contrainte sur la famille de modèle. Le bundle produit a la même forme
+que celui du pipeline interne existant.
+
+**Route B — copie des coefficients.** Pour un modèle linéaire uniquement : ordre
+des features, statistiques de standardisation, coefficients et ordonnée à
+l'origine, soit une soixantaine de nombres en JSON. L'application se réduit à un
+produit scalaire.
+
+**Aucune recalibration n'est appliquée.** L'objectif est de mesurer la
+généralisation brute ; une correction affine du niveau fausserait la mesure.
+
+L'évaluation interne se fait aux **deux niveaux**, segment et appel. Au niveau
+appel, deux références sont calculées :
+- **erreurs totales / mots de référence totaux** — la définition du WER d'un
+  appel, donc l'erreur opérationnelle de bout en bout ;
+- **moyenne des WER de segments pondérée par la durée** — la façon dont
+  l'estimateur agrège, donc l'erreur du modèle seul.
+
+---
+
+## 12. Périmètre expérimental
+
+| | bloc 2 | bloc 3 |
+|---|---|---|
+| objectif | valider le dispositif et l'effet du bruit | mesurer la généralisation |
+| langues | espagnol | 4 langues |
+| corpus | FLEURS, MLS, VoxPopuli | FLEURS (4 configs de langue), MLS (3), VoxPopuli (3) |
+| conditions | `clean`, `noise_snr5` | `clean`, `noise_snr5` |
+| segments | 1 200 | 4 000 |
+| audio | ~4 h | ~18 h |
+| protocoles | group, LODO, LOCO | group, LODO, LOLO, LOCO |
+| systèmes ASR | 3 | 3 |
+
+La couverture linguistique varie selon le corpus : MLS ne propose pas d'anglais,
+VoxPopuli pas de portugais.
+
+---
+
+## 13. Pistes non explorées
+
+Identifiées et volontairement laissées de côté à ce stade :
+
+- **Leave-one-system-out** — permuter quel modèle occupe le rôle de cible, pour
+  mesurer la dépendance de l'estimateur au triplet ASR. Coût nul en calcul, les
+  transcriptions étant déjà en cache.
+- **Winsorisation du WER** — borner le WER vrai, dont la valeur est non bornée
+  sur les références très courtes, afin que RMSE, R² et corrélations de Pearson
+  ne soient plus dominés par une poignée de segments.
+- **Sélection et ingénierie de features** — le jeu transférable a été défini par
+  une règle a priori (grandeurs sans échelle) plutôt que par une sélection
+  empirique.
+- **Autres régimes de dégradation** — réverbération, canal téléphonique, bruit à
+  spectre de parole, déjà implémentés mais non transcrits.
+- **Qualité des références VoxPopuli** — le corpus expose un indicateur de
+  transcription vérifiée, non exploité ici.
+```
