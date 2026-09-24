@@ -259,3 +259,34 @@ def evaluate_by_dataset(bundle, rows, **kwargs):
     for name, subset in split_by_dataset(rows).items():
         reports[name] = ep.evaluate_bundle(bundle, subset, **kwargs)
     return reports
+
+
+
+import json
+import merge_internal as mi
+
+INTERNAL_DIRS = {
+    "peru": "<chemin dossier Pérou>",
+    "germany": "<chemin dossier Allemagne>",
+    "spain": "<chemin dossier Espagne>",
+}
+FULL_DIR = "<chemin>/full_dataset_internal"
+
+report = mi.merge_internal_tables(INTERNAL_DIRS, FULL_DIR)
+print(json.dumps(report["datasets"], indent=1))
+print("same normalization everywhere:", report["same_norm_config"])
+
+
+
+from merge import read_table
+
+rows_test = read_table(FULL_DIR)
+mi.check_unique_ids(rows_test)
+print(json.dumps(mi.call_wer_by_dataset(rows_test), indent=1))
+
+
+
+reports = mi.evaluate_by_dataset(bundle, rows_test)
+
+print(json.dumps(reports["POOL"], indent=1))
+print(json.dumps(reports["peru"], indent=1))
