@@ -1,0 +1,113 @@
+import json
+import os
+import shutil
+from collections import Counter, defaultdict
+from pathlib import PurePosixPath
+
+import numpy as np
+
+# Folder names that sit between the call folder and the segment files
+AUDIO_SUBDIRS = {"audios"}
+
+
+def call_dir_of(path_audio):
+    """Return the call folder of a segment audio path, or None if unresolved."""
+    if not path_audio:
+        return None
+    parts = PurePosixPath(str(path_audio).replace("\\", "/")).parts
+    parent = list(parts[:-1])
+    if parent and parent[-1].lower() in AUDIO_SUBDIRS:
+        parent = parent[:-1]
+    return "/".join(parent) if parent else None
+
+
+def build_call_mapping(rows):
+    """
+    Map each segment_id to the name of its call folder.
+
+    Returns the mapping, the segments whose call could not be resolved, and
+    the folder names shared by several distinct directories, which would
+    otherwise merge two different calls into one.
+    """
+    mapping, unresolved = {}, []
+    dirs_by_name = defaultdict(set)
+    for row in rows:
+        call_dir = call_dir_of(row.get("path_audio"))
+        if call_dir is None:
+            unresolved.append(row["segment_id"])
+            continue
+        name = PurePosixPath(call_dir).name
+        dirs_by_name[name].add(call_dir)
+        mapping[row["segment_id"]] = name
+    collisions = {n: sorted(d) for n, d in dirs_by_name.items() if len(d) > 1}
+    return mapping, unresolved, collisions
+
+
+def read_jsonl(path):
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def regroup_file(path, mapping, dry_run=True):
+    """
+    Replace sample_id by the call id in a JSONL file, keeping segment_id intact.
+
+    The previous value is kept once in original_sample_id, so running the cell
+    twice does not lose it. A .bak copy is written before any change.
+    """
+    rows = read_jsonl(path)
+    for row in rows:
+        if row["segment_id"] not in mapping:
+            continue
+        row.setdefault("original_sample_id", row["sample_id"])
+        row["sample_id"] = mapping[row["segment_id"]]
+
+    if not dry_run:
+        shutil.copy2(path, path + ".bak")
+        with open(path, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return rows
+
+
+def call_summary(rows):
+    """Segment count and duration per call, to spot a wrong folder rule."""
+    counts = Counter(r["sample_id"] for r in rows)
+    minutes = defaultdict(float)
+    for r in rows:
+        minutes[r["sample_id"]] += float(r.get("duration", 0.0)) / 60.0
+    n_seg = np.array(list(counts.values()))
+    dur = np.array(list(minutes.values()))
+    return {
+        "n_segments": len(rows),
+        "n_calls": len(counts),
+        "segments_per_call": {"min": int(n_seg.min()), "median": float(np.median(n_seg)),
+                              "max": int(n_seg.max())},
+        "call_minutes": {"min": round(float(dur.min()), 2),
+                         "median": round(float(np.median(dur)), 2),
+                         "max": round(float(dur.max()), 2)},
+        "single_segment_calls": int((n_seg == 1).sum()),
+    }
+
+
+# ---- dry run ----------------------------------------------------------------
+OUT_DIR_SPAIN = "<ton dossier de sortie Espagne>"   # the folder holding table.jsonl
+
+table_path = os.path.join(OUT_DIR_SPAIN, "table.jsonl")
+segments_path = os.path.join(OUT_DIR_SPAIN, "segments.jsonl")
+
+rows = read_jsonl(table_path)
+mapping, unresolved, collisions = build_call_mapping(rows)
+
+print("resolved segments  :", len(mapping), "/", len(rows))
+print("unresolved segments:", len(unresolved), unresolved[:5])
+print("name collisions    :", len(collisions))
+for name, dirs in list(collisions.items())[:5]:
+    print(f"  {name}: {dirs}")
+
+print("\nexamples:")
+for row in rows[:5]:
+    print(f"  {row['path_audio']}\n    -> {mapping.get(row['segment_id'])}")
+
+preview = regroup_file(table_path, mapping, dry_run=True)
+print("\n", json.dumps(call_summary(preview), indent=1))
