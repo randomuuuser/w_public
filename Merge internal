@@ -1,0 +1,261 @@
+"""
+Merge the per-dataset internal tables into one pooled table.
+
+The original table.jsonl files stay untouched in their own folders; the pooled
+copy is written to a separate directory and read back with merge.read_table.
+
+Two safeguards:
+  - identifiers are prefixed with the dataset name, so that two calls or two
+    segments sharing an id in different datasets never collide;
+  - rows missing a transcription are dropped by default, because their proxy
+    features would silently be filled with zeros at prediction time, which
+    reads as a perfect agreement between systems.
+
+Pooled call-level metrics mix a between-dataset spread with the within-dataset
+one, which inflates R2 and rank metrics. Always report them next to the
+per-dataset metrics, see evaluate_by_dataset.
+"""
+
+import json
+import os
+from collections import Counter, defaultdict
+
+import numpy as np
+
+ROLES = ("target", "proxy_a", "proxy_b")
+
+
+def read_jsonl(path):
+    """
+    Load a JSONL file.
+
+    Args:
+        path: Input file path.
+
+    Returns:
+        List of records.
+    """
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def write_jsonl(rows, path):
+    """
+    Save records as JSONL.
+
+    Args:
+        rows: Records to save.
+        path: Output file path.
+
+    Returns:
+        Output file path.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return path
+
+
+def read_norm_config(directory):
+    """
+    Load the normalization settings of a dataset folder, if present.
+
+    Args:
+        directory: Dataset folder.
+
+    Returns:
+        Normalization settings, or None when the file is absent.
+    """
+    path = os.path.join(directory, "norm_config.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def prefix_row(row, dataset):
+    """
+    Tag a row with its dataset and make its identifiers globally unique.
+
+    The original identifiers are kept in dataset_sample_id and
+    dataset_segment_id.
+
+    Args:
+        row: Table record.
+        dataset: Dataset name.
+
+    Returns:
+        The same record, modified in place.
+    """
+    row["dataset"] = dataset
+    row["dataset_sample_id"] = row["sample_id"]
+    row["dataset_segment_id"] = row["segment_id"]
+    row["sample_id"] = f"{dataset}::{row['sample_id']}"
+    row["segment_id"] = f"{dataset}::{row['segment_id']}"
+    return row
+
+
+def missing_roles(row, roles=ROLES):
+    """
+    List the roles whose normalized transcription is absent from a row.
+
+    Args:
+        row: Table record.
+        roles: ASR roles expected in the row.
+
+    Returns:
+        Missing role names.
+    """
+    return [role for role in roles if row.get(f"hyp_{role}_norm") is None]
+
+
+def merge_internal_tables(dirs, out_dir, roles=ROLES, drop_incomplete=True):
+    """
+    Merge several dataset tables into one pooled table.
+
+    Args:
+        dirs: Mapping from dataset name to the folder holding its table.jsonl.
+        out_dir: Output folder of the pooled table.
+        roles: ASR roles expected in every row.
+        drop_incomplete: Drop rows missing any transcription.
+
+    Returns:
+        Merge report, per dataset and overall.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    merged, datasets, norms = [], {}, {}
+
+    for name, directory in dirs.items():
+        rows = read_jsonl(os.path.join(directory, "table.jsonl"))
+        norms[name] = read_norm_config(directory)
+
+        kept, missing = [], Counter()
+        for row in rows:
+            absent = missing_roles(row, roles)
+            missing.update(absent)
+            if absent and drop_incomplete:
+                continue
+            kept.append(prefix_row(row, name))
+
+        merged.extend(kept)
+        datasets[name] = {
+            "rows_in": len(rows),
+            "rows_kept": len(kept),
+            "missing_transcriptions": dict(missing),
+            "n_calls": len({r["sample_id"] for r in kept}),
+        }
+
+    write_jsonl(merged, os.path.join(out_dir, "table.jsonl"))
+
+    distinct = {json.dumps(v, sort_keys=True) for v in norms.values()}
+    same_norm = len(distinct) == 1
+    if same_norm:
+        with open(os.path.join(out_dir, "norm_config.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(next(iter(norms.values())), handle, indent=1)
+
+    report = {
+        "datasets": datasets,
+        "n_rows": len(merged),
+        "n_calls": len({r["sample_id"] for r in merged}),
+        "same_norm_config": same_norm,
+        "norm_configs": norms,
+    }
+    with open(os.path.join(out_dir, "merge_report.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(report, handle, indent=1, ensure_ascii=False)
+
+    return report
+
+
+def check_unique_ids(rows):
+    """
+    Verify that segment and call identifiers are unique after merging.
+
+    Args:
+        rows: Pooled records.
+
+    Returns:
+        None. Raises ValueError on duplicate segment identifiers.
+    """
+    counts = Counter(r["segment_id"] for r in rows)
+    duplicates = [k for k, v in counts.items() if v > 1]
+    if duplicates:
+        raise ValueError(f"{len(duplicates)} duplicate segment_id, e.g. {duplicates[:3]}")
+
+
+def call_wer_by_dataset(rows):
+    """
+    Word-weighted call WER per dataset and for the pool.
+
+    A pool standard deviation clearly above every per-dataset one means the
+    pool adds between-dataset spread, which inflates pooled R2.
+
+    Args:
+        rows: Pooled records.
+
+    Returns:
+        Call count, mean and standard deviation of call WER per group.
+    """
+    per_call = defaultdict(lambda: {"errors": 0.0, "words": 0.0, "dataset": None})
+    for row in rows:
+        entry = per_call[row["sample_id"]]
+        entry["errors"] += row["label_errors"]
+        entry["words"] += row["n_ref_words"]
+        entry["dataset"] = row["dataset"]
+
+    groups = defaultdict(list)
+    for entry in per_call.values():
+        if entry["words"] <= 0:
+            continue
+        wer = entry["errors"] / entry["words"]
+        groups[entry["dataset"]].append(wer)
+        groups["POOL"].append(wer)
+
+    return {
+        name: {"n_calls": len(values),
+               "call_wer_mean": round(float(np.mean(values)), 4),
+               "call_wer_std": round(float(np.std(values)), 4)}
+        for name, values in groups.items()
+    }
+
+
+def split_by_dataset(rows):
+    """
+    Split pooled records back into their datasets.
+
+    Args:
+        rows: Pooled records.
+
+    Returns:
+        Mapping from dataset name to its records.
+    """
+    subsets = defaultdict(list)
+    for row in rows:
+        subsets[row["dataset"]].append(row)
+    return dict(subsets)
+
+
+def evaluate_by_dataset(bundle, rows, **kwargs):
+    """
+    Evaluate a bundle on the pool and on each dataset separately.
+
+    The pooled report gains reliability from the number of calls; the
+    per-dataset reports tell whether calls are well ranked within a country.
+    Both are needed to read the result.
+
+    Args:
+        bundle: Trained bundle.
+        rows: Pooled records.
+        **kwargs: Passed to evaluate_public.evaluate_bundle (levels, thresholds,
+            k_values, call_reference, n_boot).
+
+    Returns:
+        Report for the pool and for every dataset.
+    """
+    import evaluate_public as ep
+
+    reports = {"POOL": ep.evaluate_bundle(bundle, rows, **kwargs)}
+    for name, subset in split_by_dataset(rows).items():
+        reports[name] = ep.evaluate_bundle(bundle, subset, **kwargs)
+    return reports
