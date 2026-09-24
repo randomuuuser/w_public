@@ -111,3 +111,20 @@ for row in rows[:5]:
 
 preview = regroup_file(table_path, mapping, dry_run=True)
 print("\n", json.dumps(call_summary(preview), indent=1))
+
+
+
+
+
+assert not unresolved, "some segments have no call folder, fix AUDIO_SUBDIRS first"
+assert not collisions, "distinct call folders share a name, resolve before writing"
+
+for path in (segments_path, table_path):
+    regroup_file(path, mapping, dry_run=False)
+    print("rewritten:", path, "(backup:", path + ".bak)")
+
+rows_after = read_jsonl(table_path)
+assert len(rows_after) == len(rows), "row count changed"
+assert [r["segment_id"] for r in rows_after] == [r["segment_id"] for r in rows], \
+    "segment_id changed"
+print(json.dumps(call_summary(rows_after), indent=1))
