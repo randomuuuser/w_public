@@ -1,0 +1,98 @@
+def call_significance(bundle, rows, call_reference="words", margin=None,
+                      alpha=0.05):
+    """
+    Significance tests on call-level WER, predicted against true.
+
+    Run at call level because calls are independent units, whereas segments
+    of one call are not: segment-level p-values would be too optimistic.
+
+    Association test: Kendall's tau (Kendall, 1938), one-sided.
+        H0: no positive association between predicted and true call WER.
+        Rejecting H0 establishes that the prediction follows the truth.
+
+    Equivalence test, when a margin is given: two one-sided t-tests, TOST
+    (Schuirmann, 1987) on the paired differences predicted minus true.
+        H0: the mean difference lies outside [-margin, +margin].
+        Rejecting H0 establishes that the systematic bias stays within the
+        margin. It says nothing about the scatter of individual calls, which
+        is why it is reported next to the association test.
+
+    Args:
+        bundle: Trained bundle.
+        rows: Labelled records.
+        call_reference: "words" (definition of a call's WER) or "duration".
+        margin: Acceptable bias in WER points, fixed before looking at the
+            results. None skips the equivalence test.
+        alpha: Significance level.
+
+    Returns:
+        Test statistics, p-values and decisions.
+    """
+    from deploy import predict as deploy_predict
+    from scipy.stats import kendalltau, spearmanr, ttest_1samp
+
+    y = np.array([r["label_wer"] for r in rows], dtype=float)
+    prediction = np.clip(deploy_predict(bundle, rows), *WER_CLIP)
+    true_calls, predicted_calls = _aggregate_calls(
+        y, prediction, rows, reference=call_reference)
+
+    tau = kendalltau(predicted_calls, true_calls, alternative="greater")
+    rho = spearmanr(predicted_calls, true_calls, alternative="greater")
+
+    report = {
+        "model": bundle.get("model"),
+        "n_calls": int(true_calls.size),
+        "call_reference": call_reference,
+        "alpha": alpha,
+        "association": {
+            "H0": "no positive association between predicted and true call WER",
+            "kendall_tau": round(float(tau.statistic), 4),
+            "kendall_p": float(tau.pvalue),
+            "spearman_rho": round(float(rho.statistic), 4),
+            "spearman_p": float(rho.pvalue),
+            "reject_H0": bool(tau.pvalue < alpha),
+        },
+    }
+
+    if margin is not None:
+        differences = predicted_calls - true_calls
+        above_lower = ttest_1samp(differences, -margin, alternative="greater")
+        below_upper = ttest_1samp(differences, margin, alternative="less")
+        p_value = float(max(above_lower.pvalue, below_upper.pvalue))
+        report["equivalence"] = {
+            "H0": f"mean bias outside [-{margin}, +{margin}]",
+            "margin": margin,
+            "mean_difference": round(float(differences.mean()), 4),
+            "p_value": p_value,
+            "reject_H0": bool(p_value < alpha),
+        }
+
+    return report
+
+
+
+
+
+
+
+import json
+import evaluate_public as ep
+import merge_internal as mi
+
+# Association only, word-weighted reference (default)
+print(json.dumps(ep.call_significance(bundle, rows_test), indent=1))
+
+# Association + equivalence, margin fixed beforehand
+print(json.dumps(ep.call_significance(bundle, rows_test, margin=0.02), indent=1))
+
+# Duration-weighted reference, as an option
+print(json.dumps(ep.call_significance(bundle, rows_test,
+                                      call_reference="duration",
+                                      margin=0.02), indent=1))
+
+# Per dataset, on the merged table
+for name, subset in mi.split_by_dataset(rows_test).items():
+    result = ep.call_significance(bundle, subset, margin=0.02)
+    print(name, result["n_calls"], "calls |",
+          "association:", result["association"]["reject_H0"], "|",
+          "equivalence:", result["equivalence"]["reject_H0"])
