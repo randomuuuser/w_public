@@ -31,6 +31,7 @@ Ce document compile les résultats des évaluations menées sur les jeux de donn
 * **wer_mean (segment)** : 0.4031
 * **wer_std (segment)** : 0.5298
 * **wer_corpus_true** : 0.1966
+* **wer_corpus_estimated** : 0.1613
 * **wer_call_mean** : 0.204 (vs_words) / 0.2267 (vs_duration)
 * **wer_call_std** : 0.0602 (vs_words) / 0.0757 (vs_duration)
 ### 2.1 Régression
