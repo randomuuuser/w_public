@@ -1,0 +1,34 @@
+## 6. Évaluations individuelles par dataset (Modèle Ridge)
+### 6.1 Régression
+
+| Dataset | Niveau d'évaluation | MAE | RMSE | $R^2$ | Biais | Pearson | Spearman | Kendall | C-index | MAPE | MAPE ($n$) | WER estimé | WER true | Gap WER | MAE CI |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **peru** | Segment | 0.1767 | 0.4004 | 0.4255 | -0.0154 | 0.661 | 0.6546 | 0.5039 | 0.7654 | 0.4436 | 2374 | 0.1522 | 0.1725 | 0.0202 | [0.1629, 0.1916][span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span) |
+|  | Appel (vs_words) | 0.021 | 0.03 | 0.659 | 0.0051 | 0.8189 | 0.8132 | 0.6364 | 0.8182 | 0.1215 | 23 | — | — | — | —[span_2](start_span)[span_2](end_span)[span_3](start_span)[span_3](end_span) |
+|  | Appel (vs_duration) | 0.0361 | 0.065 | 0.5039 | -0.0277 | 0.9018 | 0.7796 | 0.6522 | 0.8261 | 0.1439 | 23 | — | — | — | —[span_4](start_span)[span_4](end_span) |
+| **colombia** | Segment | 0.1439 | 0.2513 | 0.6727 | -0.0161 | 0.8271 | 0.6947 | 0.5375 | 0.7772 | 0.4189 | 4646 | 0.1508 | 0.1944 | 0.0435 | [0.1368, 0.1526][span_5](start_span)[span_5](end_span)[span_6](start_span)[span_6](end_span) |
+|  | Appel (vs_words) | 0.0349 | 0.0409 | 0.1587 | -0.0345 | 0.8716 | 0.8012 | 0.622 | 0.811 | 0.1748 | 41 | — | — | — | —[span_7](start_span)[span_7](end_span) |
+|  | Appel (vs_duration) | 0.0401 | 0.0456 | -0.0085 | -0.0401 | 0.8783 | 0.8118 | 0.6439 | 0.822 | 0.1958 | 41 | — | — | — | —[span_8](start_span)[span_8](end_span) |
+| **chile_old_use_case** | Segment | 0.1799 | 0.474 | 0.3844 | -0.0768 | 0.6329 | 0.7261 | 0.5583 | 0.7907 | 0.44 | 985 | 0.1636 | 0.1977 | 0.0342 | [0.1503, 0.2015][span_9](start_span)[span_9](end_span)[span_10](start_span)[span_10](end_span) |
+|  | Appel (vs_words) | 0.0244 | 0.0279 | 0.8767 | -0.0229 | 0.9909 | 0.9643 | 0.9048 | 0.9524 | 0.1144 | 7 | — | — | — | —[span_11](start_span)[span_11](end_span) |
+|  | Appel (vs_duration) | 0.0405 | 0.0483 | 0.613 | -0.0405 | 0.9446 | 0.8571 | 0.7143 | 0.8571 | 0.1765 | 7 | — | — | — | —[span_12](start_span)[span_12](end_span) |
+| **chile_telemarketing_2025** | Segment | 0.1788 | 0.4405 | 0.4111 | -0.038 | 0.6492 | 0.6875 | 0.5292 | 0.7795 | 0.403 | 2689 | 0.1717 | 0.2307 | 0.0589 | [0.162, 0.1952][span_13](start_span)[span_13](end_span)[span_14](start_span)[span_14](end_span) |
+|  | Appel (vs_words) | 0.0436 | 0.0495 | 0.44 | -0.0428 | 0.9264 | 0.9122 | 0.761 | 0.8805 | 0.1893 | 38 | — | — | — | —[span_15](start_span)[span_15](end_span) |
+|  | Appel (vs_duration) | 0.0703 | 0.0795 | 0.0248 | -0.0703 | 0.8946 | 0.8923 | 0.7297 | 0.8649 | 0.2629 | 38 | — | — | — | —[span_16](start_span)[span_16](end_span) |
+
+### 6.2 Classification (Seuil = 0.18)
+
+| Dataset | Niveau d'évaluation | $n$ | n_bad_true | Prévalence | n_bad_pred | ROC AUC | PR AUC | Précision | Rappel | F1 | F2 | Balanced Acc. | MCC | Matrice de confusion (TN, FP, FN, TP) | Top-k (k : précision, lift) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **peru** | Segment | 3068 | 1556 | 0.5072 | 1573 | 0.8452 | 0.8527 | 0.7724 | 0.7808 | 0.7766 | 0.7791 | 0.772 | 0.5442 | [1154, 358, 341, 1215] | 307: (0.9283; 1.8304) \ | 614: (0.9479; 1.869) \ | 1556: (0.777; 1.532)[span_17](start_span)[span_17](end_span)[span_18](start_span)[span_18](end_span) |
+|  | Appel (vs_words) | 23 | 7 | 0.3043 | 8 | 0.9018 | 0.8643 | 0.75 | 0.8571 | 0.8 | 0.8333 | 0.8661 | 0.7073 | [14, 2, 1, 6] | 2: (1.0; 3.2857) \ | 5: (0.8; 2.6286) \ | 7: (0.7143; 2.3469)[span_19](start_span)[span_19](end_span)[span_20](start_span)[span_20](end_span) |
+|  | Appel (vs_duration) | 23 | 14 | 0.6087 | 8 | 0.8492 | 0.9191 | 1.0 | 0.5714 | 0.7273 | 0.625 | 0.7857 | 0.5855 | [9, 0, 6, 8] | 2: (1.0; 1.6429) \ | 5: (1.0; 1.6429) \ | 14: (0.7857; 1.2908)[span_21](start_span)[span_21](end_span)[span_22](start_span)[span_22](end_span) |
+| **colombia** | Segment | 5745 | 2959 | 0.5151 | 2518 | 0.8537 | 0.8687 | 0.8292 | 0.7056 | 0.7625 | 0.7273 | 0.7757 | 0.5553 | [2356, 430, 871, 2088] | 574: (0.9669; 1.8773) \ | 1149: (0.9574; 1.8587) \ | 2959: (0.7922; 1.538)[span_23](start_span)[span_23](end_span)[span_24](start_span)[span_24](end_span) |
+|  | Appel (vs_words) | 41 | 23 | 0.561 | 14 | 0.9179 | 0.9557 | 1.0 | 0.6087 | 0.7568 | 0.6604 | 0.8043 | 0.637 | [18, 0, 9, 14] | 4: (1.0; 1.7826) \ | 8: (1.0; 1.7826) \ | 23: (0.8696; 1.5501)[span_25](start_span)[span_25](end_span)[span_26](start_span)[span_26](end_span) |
+|  | Appel (vs_duration) | 41 | 24 | 0.5854 | 14 | 0.9093 | 0.9521 | 1.0 | 0.5833 | 0.7368 | 0.6364 | 0.7917 | 0.606 | [17, 0, 10, 14] | 4: (1.0; 1.7083) \ | 8: (1.0; 1.7083) \ | 24: (0.8333; 1.4236)[span_27](start_span)[span_27](end_span)[span_28](start_span)[span_28](end_span) |
+| **chile_old_use_case** | Segment | 1204 | 633 | 0.5257 | 555 | 0.8714 | 0.8941 | 0.836 | 0.733 | 0.7811 | 0.7515 | 0.7868 | 0.5746 | [480, 91, 169, 464] | 120: (0.975; 1.8545) \ | 241: (0.9793; 1.8626) \ | 633: (0.8009; 1.5234)[span_29](start_span)[span_29](end_span)[span_30](start_span)[span_30](end_span) |
+|  | Appel (vs_words) | 7 | 4 | 0.5714 | 2 | 1.0 | 1.0 | 1.0 | 0.5 | 0.6667 | 0.5556 | 0.75 | 0.5477 | [3, 0, 2, 2] | 1: (1.0; 1.75) \ | 4: (1.0; 1.75)[span_31](start_span)[span_31](end_span) |
+|  | Appel (vs_duration) | 7 | 4 | 0.5714 | 2 | 1.0 | 1.0 | 1.0 | 0.5 | 0.6667 | 0.5556 | 0.75 | 0.5477 | [3, 0, 2, 2] | 1: (1.0; 1.75) \ | 4: (1.0; 1.75)[span_32](start_span)[span_32](end_span)[span_33](start_span)[span_33](end_span) |
+| **chile_telemarketing_2025** | Segment | 3521 | 1954 | 0.555 | 1723 | 0.8374 | 0.8715 | 0.8253 | 0.7277 | 0.7735 | 0.7454 | 0.7678 | 0.5325 | [1266, 301, 532, 1422] | 352: (0.9716; 1.7508) \ | 704: (0.9688; 1.7456) \ | 1954: (0.7876; 1.4192)[span_34](start_span)[span_34](end_span)[span_35](start_span)[span_35](end_span) |
+|  | Appel (vs_words) | 38 | 29 | 0.7632 | 18 | 0.977 | 0.9932 | 1.0 | 0.6207 | 0.766 | 0.6716 | 0.8103 | 0.5285 | [9, 0, 11, 18] | 4: (1.0; 1.3103) \ | 8: (1.0; 1.3103) \ | 29: (0.931; 1.22)[span_36](start_span)[span_36](end_span)[span_37](start_span)[span_37](end_span) |
+|  | Appel (vs_duration) | 38 | 31 | 0.8158 | 18 | 0.9585 | 0.991 | 1.0 | 0.5806 | 0.7347 | 0.6338 | 0.7903 | 0.4508 | [7, 0, 13, 18] | 4: (1.0; 1.2258) \ | 8: (1.0; 1.2258) \ | 31: (0.9355; 1.1467)[span_38](start_span)[span_38](end_span)[span_39](start_span)[span_39](end_span) |
