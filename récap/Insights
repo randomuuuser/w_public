@@ -1,0 +1,331 @@
+# Estimation du WER sans référence — Observations et analyses
+
+**Périmètre.** Régresseur entraîné sur environ 18 h de données publiques multilingues (FLEURS, MLS, VoxPopuli ; espagnol, allemand, portugais, anglais, français ; conditions propre et bruitée), puis évalué sur environ 20 h de données internes jamais vues : 5 corpus, 122 appels, 14 978 segments.
+
+Le triplet ASR est identique des deux côtés — cible `parakeet-tdt-0.6b-v3`, proxys `canary-1b-v2` et `whisper-large-v3`. Entre l'entraînement et le test, un seul facteur change : le domaine.
+
+Les définitions des grandeurs citées figurent en section 5.
+
+---
+
+## 1. Données publiques
+
+### 1.1 Le bruit élargit la plage de WER et restaure le signal exploité par la méthode
+
+L'ajout de bruit blanc à 5 dB de rapport signal/bruit avait trois objectifs : élargir la plage de WER, couvrir plusieurs niveaux de difficulté, et désaccorder les systèmes ASR. Les trois sont atteints.
+
+| corpus | WER moyen segment (propre → bruité) | σ (propre → bruité) | segments aveugles (propre → bruité) | Spearman pWER / WER (propre → bruité) |
+|---|---|---|---|---|
+| FLEURS | 0.053 → 0.150 | 0.071 → 0.155 | 9.2 % → 2.5 % | 0.64 → 0.86 |
+| MLS | 0.067 → 0.180 | 0.090 → 0.181 | 5.9 % → 1.5 % | 0.73 → 0.89 |
+| VoxPopuli | 0.076 → 0.123 | 0.115 → 0.165 | 14.5 % → 13.5 % | 0.45 → 0.60 |
+
+Un segment *aveugle* est un segment où les trois systèmes s'accordent alors que la cible se trompe : il est invisible pour une méthode fondée sur le désaccord. Le bruit triple le WER, double sa dispersion et fait chuter la part de segments aveugles — sauf sur VoxPopuli, seul corpus où elle ne baisse pas. Hypothèse : les références parlementaires ne sont pas toujours verbatim, ce qui crée du WER qu'aucun désaccord entre systèmes ne peut prédire.
+
+### 1.2 La généralisation tient sur les trois axes testés
+
+Chaque protocole retire un axe de variation de l'entraînement et mesure la performance sur ce qui a été retiré.
+
+| protocole | ce qui est retiré de l'entraînement | MAE ridge | R² ridge |
+|---|---|---|---|
+| validation groupée (IID) | rien | 0.0485 | 0.726 |
+| LOLO (*Leave-One-Language-Out*) | une langue | 0.0487 (+0.4 %) | 0.736 |
+| LOCO (*Leave-One-Condition-Out*) | une condition acoustique | 0.0500 (+3 %) | 0.707 |
+| LODO (*Leave-One-Dataset-Out*) | un corpus | 0.0501 (+3 %) | 0.711 |
+
+À titre de comparaison, prédire la moyenne d'entraînement donne un R² nul ou négatif. Changer de langue ne coûte rien ; changer de corpus ou de condition coûte 3 % de MAE. Le transfert cross-lingue rejoint les résultats de Waheed et al. (Findings ACL 2025) et d'eWER3 (Chowdhury et Ali, 2023).
+
+### 1.3 La diversité du jeu d'entraînement compte plus que le choix du modèle
+
+Dégradation de la MAE entre validation groupée et LODO, selon le jeu d'entraînement :
+
+| modèle | espagnol seul (1 200 segments) | multilingue (5 200 segments) |
+|---|---|---|
+| ridge | +11 % | +3 % |
+| lasso | +7 % | +5 % |
+| HGB | **+50 %** | +7 % |
+| XGBoost | +33 % | +4 % |
+
+Sur le jeu espagnol seul, HGB hors distribution ne fait pas mieux que le pWER brut. Sur le jeu multilingue, tous les modèles se stabilisent. Les modèles à forte capacité dépendent beaucoup plus de la diversité des données que les modèles linéaires.
+
+### 1.4 Les modèles linéaires extrapolent mieux que les arbres
+
+Un arbre prédit par paliers constants : hors de la plage de valeurs vue à l'entraînement, il plafonne, là où un modèle linéaire prolonge sa tendance. Le protocole LOCO, où l'on entraîne sur une condition acoustique et teste sur l'autre, est une extrapolation et le met en évidence.
+
+| modèle | R² validation groupée | R² LOCO | variation |
+|---|---|---|---|
+| ridge | 0.726 | 0.707 | −3 % |
+| lasso | 0.739 | 0.740 | 0 % |
+| HGB | 0.750 | 0.685 | −9 % |
+| XGBoost | 0.707 | 0.603 | **−15 %** |
+
+Le même ordre se retrouve sur le corpus interne le plus éloigné du jeu d'entraînement (Allemagne, niveau segment) : R² ridge 0.59, lasso 0.57, HGB 0.51, XGBoost 0.48.
+
+### 1.5 Le pWER brut ordonne bien, mais à la mauvaise échelle
+
+Le pWER est le désaccord entre la transcription cible et celles des proxys, utilisé directement comme estimation du WER — c'est le baseline « W PROXY » de Waheed et al.
+
+En LODO, aucun modèle ne le bat sur les métriques de rang : Spearman 0.728 contre 0.661 à 0.705 pour les régresseurs, indice de concordance 0.796 contre 0.767 à 0.787. Mais son R² vaut −0.54 : utilisé tel quel comme estimation, il fait pire qu'une constante.
+
+Deux systèmes ASR suffisent donc à dire si un audio est difficile, pas de combien. La régression apprend l'échelle ; l'ordre est déjà contenu dans le désaccord.
+
+### 1.6 La qualité du pWER dépend du régime de WER
+
+| jeu de test | WER moyen | R² du pWER |
+|---|---|---|
+| public, propre | 0.064 | −3.51 |
+| public, bruité | 0.151 | +0.16 |
+| interne, segments (pool) | 0.403 | +0.51 |
+
+**Mécanisme proposé.** Le pWER additionne les erreurs de la cible et celles du proxy. À WER faible, il est dominé par l'erreur du proxy et présente un plancher : sur les données publiques propres, 20 à 42 % des segments ont un pWER exactement nul. À WER élevé, la contribution du proxy devient négligeable et le pWER se rapproche du WER vrai.
+
+**Conséquence en interne.** Au niveau segment, régime difficile, le pWER est très compétitif (R² 0.51, biais −0.005, Kendall 0.61). Au niveau appel, il est moins bon sur le rang que les régresseurs (Kendall 0.54 contre 0.59 pour ridge) et son biais change de signe selon le corpus : surestimation au Pérou (+0.031) et en Allemagne (+0.018), sous-estimation d'environ 0.03 en moyenne sur les trois autres corpus. Un estimateur dont le sens de l'erreur n'est pas prévisible est difficile à exploiter.
+
+---
+
+## 2. Données internes
+
+### 2.1 Le transfert fonctionne au niveau appel
+
+Pool des 5 corpus, 122 appels, référence pondérée par mots :
+
+| modèle | MAE | MAPE | R² | biais | Spearman | Kendall | ROC AUC (seuil 0.18) |
+|---|---|---|---|---|---|---|---|
+| **ridge** | **0.033** | **15.9 %** | **0.559** | −0.024 | 0.773 | 0.589 | 0.864 |
+| HGB | 0.034 | 16.0 % | 0.502 | −0.025 | 0.764 | 0.576 | 0.867 |
+| lasso | 0.035 | 16.5 % | 0.477 | −0.027 | 0.779 | 0.594 | 0.870 |
+| XGBoost | 0.049 | 23.1 % | 0.064 | −0.046 | 0.742 | 0.560 | 0.848 |
+| pWER brut | 0.034 | 17.7 % | 0.511 | −0.015 | 0.731 | 0.542 | 0.829 |
+| moyenne d'entraînement | 0.097 | 43.3 % | −2.568 | −0.097 | −0.029 | −0.019 | 0.487 |
+
+Sur un WER d'appel moyen de 0.204, l'erreur typique de ridge est de 3.3 points, soit 16 % en relatif, sans aucune donnée interne à l'entraînement. Face au pWER brut, l'apport des régresseurs porte surtout sur le R² et sur le rang.
+
+### 2.2 Les tests statistiques valident le lien entre WER prédit et WER vrai
+
+Les tests sont menés au niveau appel, où les unités sont indépendantes, avec un seuil de 5 % et la référence pondérée par mots. L'acceptation repose sur le **rejet** de l'hypothèse nulle.
+
+- **Association** — τ de Kendall unilatéral (Kendall, 1938). H0 : pas d'association positive entre WER prédit et WER vrai.
+- **Équivalence** — test TOST (Schuirmann, 1987). H0 : biais moyen hors de l'intervalle [−0.05, +0.05].
+
+| ridge | appels | association | équivalence ±0.05 |
+|---|---|---|---|
+| pool | 122 | rejetée ✓ | rejetée ✓ |
+| Pérou | 23 | rejetée ✓ | rejetée ✓ |
+| Allemagne | 13 | rejetée ✓ | rejetée ✓ |
+| Colombie | 41 | rejetée ✓ | rejetée ✓ |
+| Chili *old use case* | 7 | rejetée ✓ | rejetée ✓ |
+| Chili *telemarketing 2025* | 38 | rejetée ✓ | rejetée ✓ |
+
+Le baseline « moyenne d'entraînement » échoue à tous les tests : **les tests sont discriminants**, ils ne valident pas n'importe quel estimateur.
+
+Précautions :
+- le Chili *old use case* repose sur 7 appels : conclusion valide mais fragile ;
+- le Chili *telemarketing* passe le test d'équivalence de justesse (p ≈ 0.04, valeur reconstituée à partir du biais et de la RMSE) ;
+- une marge de ±0.05 représente 25 % d'un WER d'appel de 0.20. Sur le pool, une marge de ±0.03 resterait satisfaite (p ≈ 0.02, reconstitué) ; une marge de ±0.025 ne le serait plus. La marge doit être fixée par le métier avant de regarder les résultats ;
+- le test d'équivalence porte sur le biais moyen, pas sur l'erreur de chaque appel : il se lit avec la MAE.
+
+### 2.3 Ridge est le modèle à intégrer
+
+- **Meilleur sur le pool** au niveau appel : MAE, R², plus faible sous-estimation des modèles entraînés, meilleur rappel.
+- **Meilleur aussi corpus par corpus** : MAE inférieure ou égale à celle de HGB sur 4 corpus sur 5, R² supérieur sur 4 sur 5. La recommandation ne repose pas sur un effet d'agrégation.
+- **Le plus stable hors distribution** (section 1.4).
+- **Satisfait les tests d'acceptation** sur tous les corpus, y compris le Chili *telemarketing* où HGB échoue au test d'équivalence. À biais quasi identique (−0.043 contre −0.044), ridge passe parce que ses erreurs varient moins d'un appel à l'autre.
+
+XGBoost est à écarter : R² d'appel quasi nul, biais le plus fort. Son objectif MAE lui fait apprendre la médiane conditionnelle ; sur une distribution de WER asymétrique, la médiane est inférieure à la moyenne, et l'agrégation au niveau appel amplifie cette sous-estimation.
+
+### 2.4 Les modèles sous-estiment, d'où une précision supérieure au rappel
+
+Le WER moyen du jeu d'entraînement public est de 0.108 ; celui des appels internes de 0.204. Les modèles régularisés rétrécissent leurs prédictions vers la moyenne d'entraînement, donc sous-estiment. Moins d'appels franchissent le seuil, mais ceux qui le franchissent sont bien mauvais.
+
+Pool, seuil 0.18, 70 appels réellement mauvais :
+
+| modèle | biais | appels prédits mauvais | précision | rappel |
+|---|---|---|---|---|
+| pWER brut | −0.015 | 59 | 0.81 | 0.69 |
+| ridge | −0.024 | 51 | 0.92 | 0.67 |
+| HGB | −0.025 | 52 | 0.87 | 0.64 |
+| lasso | −0.027 | 49 | 0.92 | 0.64 |
+| XGBoost | −0.046 | 30 | 1.00 | 0.43 |
+
+Le rappel décroît avec l'ampleur de la sous-estimation. Corpus par corpus avec ridge, **le signe du biais dicte le sens du compromis, sans exception** :
+
+| corpus | biais ridge | précision | rappel |
+|---|---|---|---|
+| Allemagne | +0.012 | 0.78 | **1.00** |
+| Pérou | +0.005 | 0.75 | **0.86** |
+| Chili *old use case* | −0.023 | **1.00** | 0.50 |
+| Colombie | −0.035 | **1.00** | 0.61 |
+| Chili *telemarketing* | −0.043 | **1.00** | 0.62 |
+
+Sur les trois corpus sous-estimés, la précision vaut exactement 1 : aucun faux positif. Quand l'outil signale un appel, il a raison ; il en manque une partie. Le modèle généralise donc sur une distribution différente de celle de l'entraînement, au prix d'un décalage de niveau.
+
+### 2.5 Un biais variable selon le corpus, qui pèse sur le pool et sur les seuils cibles
+
+Ridge, niveau appel, référence mots, seuil 0.18 pour le F2 :
+
+| corpus | appels | WER vrai | MAE | R² | biais | Spearman | Kendall | F2 |
+|---|---|---|---|---|---|---|---|---|
+| Allemagne | 13 | 0.204 | 0.019 | 0.756 | +0.012 | 0.978 | **0.923** ✓ | **0.946** ✓ |
+| Pérou | 23 | 0.172 | 0.021 | 0.659 | +0.005 | 0.813 | 0.636 | 0.833 |
+| Chili *old use case* | 7 | 0.201 | 0.024 | 0.877 | −0.023 | 0.964 | **0.905** ✓ | 0.556 |
+| Colombie | 41 | 0.196 | 0.035 | 0.159 | −0.035 | 0.801 | 0.622 | 0.660 |
+| Chili *telemarketing* | 38 | 0.233 | 0.044 | 0.440 | −0.043 | 0.912 | **0.761** ✓ | 0.672 |
+| **pool** | 122 | 0.204 | 0.033 | 0.559 | −0.024 | 0.773 | 0.589 | 0.710 |
+
+**Le classement tient partout, la calibration dépend du corpus.** Le Spearman va de 0.80 à 0.98. Là où le R² chute, c'est un décalage constant qui en est la cause : sur la Colombie et le Chili *telemarketing*, le biais représente plus de 70 % de l'erreur quadratique. Le Chili *telemarketing* a même le meilleur Spearman des grands corpus (0.91) et un R² de 0.44 : les appels sont presque parfaitement ordonnés, mais annoncés 4.3 points trop bas. Ce n'est pas une question de langue — Pérou, Colombie et Chili sont hispanophones et se comportent très différemment ; le type de conversation est une hypothèse plausible.
+
+**Les seuils cibles (Kendall ≥ 0.7, F2 ≥ 0.85) ne sont pas atteints sur le pool**, mais le sont sur certains corpus : Kendall sur 3 corpus sur 5, F2 sur l'Allemagne. Deux mécanismes l'expliquent.
+
+*Le pool dégrade le classement.* Le Kendall poolé (0.589) est inférieur à celui de chacun des cinq corpus. Le biais varie de +0.012 en Allemagne à −0.043 au Chili *telemarketing* : un appel chilien à 0.25 de WER réel est annoncé autour de 0.21, et un appel allemand à 0.20 de WER réel est lui aussi annoncé autour de 0.21. Dans le pool, les deux se retrouvent au même rang alors que l'un est nettement plus dégradé. Chaque corpus est bien ordonné isolément ; c'est la juxtaposition de biais différents qui brouille l'ordre entre corpus. Or le besoin opérationnel est de classer les appels au sein d'une même campagne : le Kendall poolé en est une borne basse.
+
+*Le F2 pénalise structurellement la sous-estimation.* Le F2 donne plus de poids au rappel qu'à la précision ; or la sous-estimation abaisse le rappel (section 2.4). Seule l'Allemagne, légèrement surestimée, atteint un rappel de 1 et un F2 de 0.95.
+
+### 2.6 La référence pondérée par mots est la bonne
+
+Ridge, pool :
+
+| référence | WER d'appel moyen | MAE | R² | biais | Kendall |
+|---|---|---|---|---|---|
+| pondérée par mots | 0.204 | **0.033** | **0.559** | **−0.024** | 0.589 |
+| pondérée par durée | 0.227 | 0.049 | 0.339 | −0.047 | **0.643** |
+
+La référence par durée est meilleure sur le rang, moins bonne sur l'erreur. L'écart de biais entre les deux (−0.023) est exactement l'écart entre les deux vérités (0.227 − 0.204) : les prédictions sont les mêmes, seule la référence change. Avec un biais de −0.047 quasi égal à la marge de 0.05, l'équivalence n'est pas établissable en référence durée. Hypothèse sur la cause : la pondération par durée donne plus de poids aux segments lents, hésitants ou fragmentés, qui portent peu de mots et beaucoup d'erreurs.
+
+L'argument décisif est toutefois **définitionnel** : le WER d'un appel est le nombre total d'erreurs divisé par le nombre total de mots de référence, convention de sclite (NIST), de jiwer et de speechkit. La référence par durée reste un diagnostic ; elle ne doit pas être choisie après coup parce qu'elle passerait un test.
+
+### 2.7 L'agrégation au niveau appel élimine l'erreur aléatoire, pas le biais
+
+Ridge, pool, du segment à l'appel : MAE 0.162 → 0.033, Spearman 0.708 → 0.773, R² 0.512 → 0.559.
+
+Un appel contient en moyenne 123 segments. Une erreur se décompose exactement en biais au carré plus variance : la partie aléatoire (surestimation d'un segment, sous-estimation du suivant) se compense dans la moyenne, le biais non.
+
+| ridge, pool | RMSE | biais | part du biais dans l'erreur quadratique |
+|---|---|---|---|
+| segment | 0.370 | −0.029 | 0.6 % |
+| appel | 0.040 | −0.024 | 35 % |
+
+Le biais est presque le même aux deux niveaux ; c'est le bruit autour qui disparaît. L'ordre de grandeur est cohérent avec une moyenne sur une centaine d'erreurs peu corrélées (réduction d'un facteur √123 ≈ 11). Conséquence : au niveau qui compte, le biais est devenu la principale source d'erreur, et c'est lui qu'il faut réduire.
+
+### 2.8 Le triage est directement exploitable
+
+- **Segments** : parmi les 10 % jugés les plus dégradés, 97.5 % le sont réellement avec ridge (prévalence 52.9 %, soit un lift de 1.84). Même ordre de grandeur sur chaque corpus : 93 à 100 %.
+- **Appels** : parmi les 24 appels jugés les plus dégradés (20 % du pool), **100 % le sont réellement**, contre 96 % pour le pWER brut et 63 % au hasard.
+
+### 2.9 La classification au niveau appel devient mesurable sur le pool
+
+Avec 70 appels positifs sur 122, les métriques de classification ne basculent plus au gré d'un seul appel, contrairement aux évaluations corpus par corpus. Ridge, seuil 0.18, référence mots : ROC AUC 0.86, PR AUC 0.91, précision 0.92, rappel 0.67, MCC 0.60.
+
+Par corpus, elles restent fragiles : la prévalence au seuil 0.18 va de 0.30 (Pérou) à 0.76 (Chili *telemarketing*). Un seuil unique ne se comporte pas de la même façon d'une campagne à l'autre.
+
+---
+
+## 3. Pistes d'amélioration et d'évaluation
+
+1. **Perturbations plus nombreuses et plus sévères à l'entraînement**, pour rapprocher le WER moyen du jeu d'entraînement (0.108) de celui des données internes (0.204). C'est le levier qui agit directement sur la cause de la sous-estimation, et donc sur le rappel. Réverbération, canal téléphonique 8 kHz avec compression G.711, bruit à spectre de parole, écho et saturation sont déjà implémentés ; ce sont des familles de perturbations utilisées par Waheed et al.
+
+2. **Généralisation à d'autres systèmes ASR cibles** : entraîner avec un système X en cible et tester avec un système Z. Les transcriptions étant déjà disponibles, il suffit de permuter les rôles, sans nouvelle inférence.
+
+3. **Sélection de features** : le jeu actuel a été défini par une règle a priori (grandeurs sans échelle) plutôt que par une sélection empirique.
+
+4. **Décomposer la prédiction en substitutions, suppressions et insertions** (S, D, I). Waheed et al. présentent cette expérience en annexe avec de meilleures performances, mais les comptes y sont normalisés par la longueur de la référence, inconnue en production. La décomposition apporte pourtant elle-même la solution : par construction de l'alignement, la référence compte C + S + D mots et l'hypothèse C + S + I, d'où l'identité exacte
+
+   $$N_{\text{ref}} = N_{\text{hyp}} + D - I$$
+
+   La longueur de la référence se reconstitue donc à partir de la longueur de l'hypothèse, connue, et des comptes D et I prédits.
+
+5. **Évaluer séparément les parties client et opérateur** : la qualité de l'estimation peut différer selon le rôle du locuteur (débit, vocabulaire, qualité du canal).
+
+6. **Seuil de décision calibré par campagne**, sur des appels annotés distincts de ceux de l'évaluation, pour compenser le décalage de niveau sans modifier les prédictions.
+
+---
+
+## 4. Notes de lecture
+
+**L'unité comparable entre données publiques et internes est le segment, pas l'appel.** Les audios publics sont des énoncés isolés de moins de 30 s, prédits et évalués tels quels, sans agrégation. Leurs résultats se comparent donc aux résultats internes au niveau segment. Comparer la MAE publique (segment) à la MAE interne d'appel ferait croire, à tort, que le modèle est meilleur sur des données qu'il n'a jamais vues.
+
+| | unité | WER moyen | σ | MAE ridge | R² ridge |
+|---|---|---|---|---|---|
+| public (LODO) | segment | 0.108 | 0.142 | 0.050 | 0.711 |
+| interne (pool) | segment | 0.403 | 0.530 | 0.162 | 0.512 |
+| interne (pool) | appel | 0.204 | 0.060 | 0.033 | 0.559 |
+
+À unité égale, les données internes sont nettement plus difficiles.
+
+**Même au niveau segment, les deux populations diffèrent.** Le rapport entre WER moyen par segment et WER de corpus vaut 1.02 en public contre 2.05 en interne. Un rapport proche de 1 signifie des segments de longueur homogène ; à 2.05, la moyenne est tirée par de nombreux segments courts dont le WER, divisé par peu de mots de référence, n'est pas borné. Hypothèse : les segments internes sont des tours de parole issus de la diarisation, souvent très brefs — un régime absent des données publiques.
+
+**Un Pearson très inférieur au Spearman signale des valeurs extrêmes, pas une absence de signal.** Exemple : MLS bruité, Pearson 0.24 et Spearman 0.89. Un segment de deux mots avec trois insertions a un WER de 1.5 et suffit à déformer une corrélation linéaire, sans affecter une corrélation de rang.
+
+**Le R² dépend de la dispersion du jeu de test** : il rapporte l'erreur à la dispersion de la vérité. Il se présente toujours accompagné de l'écart-type du WER du sous-ensemble évalué.
+
+---
+
+## 5. Définitions
+
+**Notations.** Pour un segment $i$ : $S_i$, $D_i$, $I_i$ ses substitutions, suppressions et insertions ; $E_i = S_i + D_i + I_i$ ses erreurs ; $N_i$ le nombre de mots de la référence ; $H_i$ le nombre de mots de l'hypothèse ; $d_i$ sa durée. Un appel $c$ est un ensemble de segments. Toutes les transcriptions sont normalisées de la même façon avant calcul.
+
+### Niveau segment
+
+WER vrai d'un segment :
+
+$$w_i = \frac{E_i}{N_i}$$
+
+Si la référence est vide, $w_i = 1$ en présence d'insertions et $0$ sinon. Le WER d'un segment n'est pas borné à 1.
+
+WER prédit d'un segment : $\hat{w}_i$, sortie du régresseur, bornée à $[0, 2]$.
+
+**`wer_mean`** (WER vrai moyen) et **`wer_std`** : moyenne et écart-type des $w_i$ sur les segments évalués, chaque segment ayant le même poids.
+
+### Niveau corpus
+
+**`wer_corpus_true`** : WER du corpus, pondéré par mots.
+
+$$W_{\text{corpus}} = \frac{\sum_i E_i}{\sum_i N_i}$$
+
+**`wer_corpus_estimated`** : WER du corpus estimé. La référence étant inconnue en production, la pondération utilise la longueur de l'hypothèse.
+
+$$\hat{W}_{\text{corpus}} = \frac{\sum_i \hat{w}_i \, \max(H_i, 1)}{\sum_i \max(H_i, 1)}$$
+
+**Gap WER** : $\left| \hat{W}_{\text{corpus}} - W_{\text{corpus}} \right|$.
+
+### Niveau appel
+
+WER prédit d'un appel, identique pour les deux références : moyenne des WER prédits de ses segments, pondérée par la durée.
+
+$$\hat{W}_c = \frac{\sum_{i \in c} \hat{w}_i \, d_i}{\sum_{i \in c} d_i}$$
+
+WER vrai d'un appel, référence **`vs_words`** — définition du WER d'un appel, référence par défaut :
+
+$$W_c^{\text{mots}} = \frac{\sum_{i \in c} E_i}{\sum_{i \in c} N_i}$$
+
+WER vrai d'un appel, référence **`vs_duration`** — diagnostic :
+
+$$W_c^{\text{durée}} = \frac{\sum_{i \in c} w_i \, d_i}{\sum_{i \in c} d_i}$$
+
+**`wer_call_mean`** (`call_wer_mean`) et **`wer_call_std`** : moyenne et écart-type des $W_c$ sur les appels, chaque appel ayant le même poids, calculés pour la référence considérée.
+
+### Métriques
+
+Les métriques se calculent sur les paires $(\hat{w}_i, w_i)$ au niveau segment, et sur les paires $(\hat{W}_c, W_c)$ au niveau appel. Pour $n$ paires $(\hat{y}_k, y_k)$ :
+
+| métrique | définition |
+|---|---|
+| MAE | $\frac{1}{n} \sum_k \lvert \hat{y}_k - y_k \rvert$ |
+| RMSE | $\sqrt{\frac{1}{n} \sum_k (\hat{y}_k - y_k)^2}$ |
+| R² | $1 - \frac{\sum_k (\hat{y}_k - y_k)^2}{\sum_k (y_k - \bar{y})^2}$ |
+| biais | $\frac{1}{n} \sum_k (\hat{y}_k - y_k)$ — négatif en cas de sous-estimation |
+| MAPE | $\frac{1}{n'} \sum_{k : y_k > 0} \frac{\lvert \hat{y}_k - y_k \rvert}{y_k}$, calculée sur les seules valeurs vraies non nulles |
+| Spearman, Kendall, indice de concordance | qualité de l'ordre entre prédictions et valeurs vraies |
+| précision, rappel, F1, F2, MCC | détection des éléments dont le WER vrai dépasse le seuil, à partir des éléments dont le WER prédit le dépasse |
+
+---
+
+## 6. Points clés
+
+1. **Entraînement sur environ 18 h de données publiques multilingues** (espagnol, allemand, portugais, anglais, français), **évaluation sur environ 20 h de données internes** jamais vues : 5 corpus, 122 appels.
+2. **Le modèle retenu est ridge** : le meilleur sur le pool et corpus par corpus, le plus stable hors distribution, et il satisfait les tests d'acceptation sur tous les corpus.
+3. **Bonne généralisation entre langues** : changer de langue ne coûte rien ; changer de corpus ou de condition acoustique coûte 3 % de MAE.
+4. **MAE d'appel de 0.033 sur le pool**, soit environ 3 points de WER sur un WER moyen de 0.20 (16 % en relatif), entre 0.019 et 0.044 selon le corpus.
+5. **Le lien entre WER prédit et WER vrai est statistiquement établi**, ainsi que l'équivalence à ±5 points ; un estimateur sans information échoue à tous ces tests.
+6. **Bons résultats en tri et en classement** : les 20 % d'appels jugés les pires sont tous réellement dégradés, et 97.5 % des 10 % de segments signalés le sont.
+7. **Calibration globalement bonne mais variable selon le corpus** : biais de +0.012 à −0.043. La sous-estimation qui en découle donne une précision supérieure au rappel.
+8. **Facteurs qui influencent les résultats** : la qualité des systèmes ASR (le désaccord entre systèmes est d'autant plus informatif que le régime est difficile), la dispersion du WER vrai du corpus évalué (dont dépend le R²), et l'écart entre le WER du jeu d'entraînement et celui du domaine cible (dont dépend le biais).
