@@ -1,0 +1,171 @@
+Partie A — Deux modifications dans evaluate_public.py
+
+1. apply_export : même calcul de features que deploy.predict, et vérification de la normalisation. Remplace la fonction entière par :
+
+def apply_export(export, rows, norm_config=None):
+    """
+    Apply an exported ridge to new records, labelled or not.
+
+    Features are built with deploy.features_for_inference, the exact path used
+    by deploy.predict, so the exported model scores rows identically to the
+    bundle it was taken from.
+
+    Args:
+        export: Output of ridge_export.
+        rows: Records to score.
+        norm_config: Normalization used for these records, checked against the
+            one recorded at training time.
+
+    Returns:
+        Predicted WER per segment.
+    """
+    from deploy import entries_to_matrix, features_for_inference
+
+    if norm_config is not None and export.get("norm_config") and \
+            dict(norm_config) != export["norm_config"]:
+        raise ValueError(f"normalization mismatch: trained with "
+                         f"{export['norm_config']}, called with {dict(norm_config)}")
+
+    entries = features_for_inference(rows, tuple(export["blocks"]),
+                                     tuple(export["roles"]))
+    seen = {key for entry in entries for key in entry}
+    missing = [n for n in export["feature_names"] if n not in seen]
+    if missing:
+        raise ValueError(f"features missing from the records: {missing}")
+
+    X = entries_to_matrix(entries, export["feature_names"])
+    standardized = (X - np.array(export["scaler_mean"])) \
+        / np.array(export["scaler_scale"])
+    raw = standardized @ np.array(export["coef"]) + export["intercept"]
+    return np.clip(raw, *export["clip"])
+
+
+
+
+
+2. ridge_export : enregistrer la normalisation. Ajoute le paramètre norm_config=None à la signature, puis cette ligne dans le dictionnaire retourné :
+        "norm_config": dict(norm_config or {}),
+
+
+-***********************************************************
+
+Partie B — Exporter les poids (une seule fois)
+
+À faire sur la machine où se trouve le pack public là où entraîné le bundle des tests
+
+Étape 1 — Recharger exactement le pool d'entraînement des tests.
+
+import json
+import numpy as np
+import deploy
+import run_public as rp
+import evaluate_public as ep
+from prepare_dataset import DEFAULT_NORM
+
+INTERNAL_PACK = "<chemin>/wer_public_pack"
+pool_public, _ = rp.load_pool(rp.PLAN_BLOCK3, drive_root=INTERNAL_PACK)
+
+
+
+
+Étape 2 — Exporter.
+export = ep.ridge_export(pool_public, norm_config=DEFAULT_NORM)
+export["asr_systems"] = {"target": "parakeet-tdt-0.6b-v3",
+                         "proxy_a": "canary-1b-v2",
+                         "proxy_b": "whisper-large-v3"}
+
+
+
+
+Étape 3 — Vérifier que l'export est identique au modèle testé.
+from merge import read_table
+rows_test = read_table("<chemin>/full_dataset_internal")
+
+bundle = ep.fit_bundle(pool_public, model="ridge")      # same call as in the tests
+print("alpha :", export["alpha"], "|", bundle["best_params"])
+gap = np.abs(ep.apply_export(export, rows_test) - deploy.predict(bundle, rows_test))
+print("max |export - bundle| :", gap.max())            # expected below 1e-9
+
+assert export["feature_names"] == bundle["feature_names"], "feature set differs"
+print(export["feature_set"], len(export["feature_names"]), "features")   # transferable 22
+
+
+
+
+Étape 4 — Écrire le fichier.
+with open("ridge_wer_v1.json", "w", encoding="utf-8") as handle:
+    json.dump(export, handle, indent=1)
+
+
+
+-***********************************************************
+
+Partie C — Inférence sur le nouveau cas d'usage, sans annotation
+
+Étape 5 — Préparer les segments à partir de la segmentation automatique.
+import os
+from prepare_dataset import (DEFAULT_NORM, export_segments, read_segments,
+                             write_nemo_manifest, write_norm_config, write_records)
+
+JSON_PATH = "<nouveau use case>/transcription_dataset.json"
+OUT_DIR = "<dossier de sortie du nouveau use case>"
+LANG = "es"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+write_norm_config(OUT_DIR, DEFAULT_NORM)
+records, stats = read_segments(JSON_PATH, LANG, min_ref_words=0,
+                               source="prediction", norm_config=DEFAULT_NORM)
+records, failures = export_segments(records, os.path.join(OUT_DIR, "wav"))
+write_records(records, os.path.join(OUT_DIR, "segments.jsonl"))
+write_nemo_manifest(records, os.path.join(OUT_DIR, "manifest.json"))
+print(stats, "| failures:", len(failures))
+
+
+
+
+Étape 6 — Transcrire avec le même triplet. vérifier que transcribe.SYSTEMS c'ets bien parakeet target ...
+import pipeline as pl
+pl.transcribe(records, OUT_DIR)
+
+
+
+
+Étape 7 — Fusionner sans calculer de labels.
+import merge_internal as mi
+from merge import merge_transcriptions
+from prepare_dataset import read_norm_config
+from transcribe import load_cache
+
+ROLES = ("target", "proxy_a", "proxy_b")
+results = {role: {sid: r["text"] for sid, r in
+                  load_cache(os.path.join(OUT_DIR, "asr", f"{role}.jsonl")).items()}
+           for role in ROLES}
+rows, coverage = merge_transcriptions(records, results, read_norm_config(OUT_DIR))
+
+# Same rule as the merged test table: a missing transcription would be read as
+# a perfect agreement between systems
+rows = [r for r in rows if not mi.missing_roles(r)]
+
+# Test segments always held annotated speech; drop segments where no system
+# heard anything, and report how many
+silent = [r for r in rows if not any(r[f"hyp_{k}_norm"] for k in ROLES)]
+rows = [r for r in rows if any(r[f"hyp_{k}_norm"] for k in ROLES)]
+print(coverage, "| kept:", len(rows), "| silent dropped:", len(silent))
+
+
+
+
+
+Étape 8 — Charger les poids et prédire.
+import json
+import pandas as pd
+import evaluate_public as ep
+
+with open("ridge_wer_v1.json", encoding="utf-8") as handle:
+    export = json.load(handle)
+
+segment_wer = ep.apply_export(export, rows, norm_config=read_norm_config(OUT_DIR))
+calls = pd.DataFrame(ep.predict_calls_export(export, rows))   # worst call first
+print(calls.to_string(index=False))
+
+
