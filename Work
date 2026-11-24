@@ -1,0 +1,121 @@
+import argparse
+import datetime
+import itertools
+import os
+import subprocess
+import time
+
+# Define CAFIT variables
+TOKENS = {
+    'GER': "token_GER",
+    'COL': "token_COL",
+    'PER': "token_PER",
+}
+os.environ['CAFIT_TASK_UNAVAILABLE_DELAY'] = '5'
+os.environ['CAFIT_CLIENT_HOST'] = "call-analyzer-api-assurance-tmp.staging.echonet"
+os.environ['CAFIT_CLIENT_PORT'] = "443"
+
+# Paths to the scripts
+SCRIPT_TRANSCRIPTION = "/mnt/code/mocks_for_cafit/deploy_worker_transcription.py"
+SCRIPT_TEXT_ANALYSIS = "/mnt/code/mocks_for_cafit/deploy_worker_text_analysis.py"
+SLEEP_TIME = 30  # in seconds
+TIMEOUT_DELAY = 15  # how many seconds to wait to ensure the worker terminated
+UNTIL_WHEN = datetime.datetime(2032, 1, 1, 0, 0)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Cycle through CAFIT worker tokens and launch worker subprocesses."
+    )
+    parser.add_argument(
+        "--skip-speech",
+        nargs="*",
+        choices=list(TOKENS.keys()),
+        default=[],
+        help="Country code(s) for which to skip the transcription (speech) worker (e.g., --skip-speech GER).",
+    )
+    parser.add_argument(
+        "--skip-analysis",
+        nargs="*",
+        choices=list(TOKENS.keys()),
+        default=[],
+        help="Country code(s) for which to skip the text analysis worker (e.g., --skip-analysis GER).",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    skip_speech = set(args.skip_speech)
+    skip_analysis = set(args.skip_analysis)
+
+    # Create an infinite cycle of the token keys
+    token_iterator = itertools.cycle(TOKENS.keys())
+
+    print("Starting token rotation loop...")
+    if skip_speech:
+        print(f"Skipping speech (transcription) for: {', '.join(sorted(skip_speech))}")
+    if skip_analysis:
+        print(f"Skipping text analysis for: {', '.join(sorted(skip_analysis))}")
+
+    while datetime.datetime.now() < UNTIL_WHEN:
+        try:
+            # 1/ Get the next token from the cycle and assign it to the environment variable
+            current_country = next(token_iterator)
+            current_token = TOKENS[current_country]
+            os.environ['CAFIT_WORKER_TOKEN'] = current_token
+
+            print(f"\n--- Iteration with Token: {current_country} ---")
+
+            # 2/ Launch the transcription script unless skipped for this country
+            run_speech = current_country not in skip_speech
+            if run_speech:
+                proc_trans = subprocess.Popen(
+                    ["python3", SCRIPT_TRANSCRIPTION],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+            # 3/ Launch the text analysis script unless skipped for this country
+            run_analysis = current_country not in skip_analysis
+            if run_analysis:
+                proc_analysis = subprocess.Popen(
+                    ["python3", SCRIPT_TEXT_ANALYSIS],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+            print("Subprocesses launched.")
+
+            # 4/ Wait for SLEEP_TIME seconds
+            print(f"Waiting for {SLEEP_TIME} seconds...")
+            time.sleep(SLEEP_TIME)
+
+            # 5/ Kill launched subprocesses
+            print("Terminating subprocesses...")
+            if run_speech:
+                proc_trans.terminate()
+            if run_analysis:
+                proc_analysis.terminate()
+
+            # Optional: Ensure they are actually dead if terminate() doesn't work immediately
+            if run_speech:
+                proc_trans.wait(timeout=TIMEOUT_DELAY)
+            if run_analysis:
+                proc_analysis.wait(timeout=TIMEOUT_DELAY)
+
+            print("Subprocesses terminated successfully.\n")
+
+        except KeyboardInterrupt:
+            print("\nLoop interrupted by user.")
+            break
+        except Exception as e:
+            print(f"An error occurred during iteration: {e}")
+            # Depending on your needs, you might want to break here or continue
+            break
+
+    print('Done. Script ended gracefully!')
+
+
+if __name__ == "__main__":
+    main()
